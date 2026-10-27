@@ -91,7 +91,7 @@ An earlier revision of this fork pinned both empty and deleted the cards, which 
 greyed-out control that silently drops your input is worse than no control. Read the two cards with
 their real strengths: the IP list is bound to the connection and cannot be faked from the other side,
 while an id is self-reported and carries no signature, so it keeps out a mistyped address rather than
-an attacker. Neither one widens the guard above; a target outside the allow-list is refused before
+an attacker. Neither one widens the guard above; a target the guard does not allow is refused before
 either check sees a packet.
 
 ### Editing the file directly
@@ -139,8 +139,8 @@ listener to move. Leaving the option unset keeps `21118`. A value that is not a 
 `1-65535` is refused at startup with an explanation instead of quietly falling back, because a
 silently wrong port is indistinguishable from a firewall problem on site.
 
-The port is a port, not a destination: it cannot widen the allow-list, every dial still has to
-match `intranet-allowlist.conf`.
+The port is a port, not a destination: it cannot widen what the guard allows. Every dial still has
+to match the policy - the ranges the file names, or all private space when it names none.
 
 You can also override the port per connection by typing it into the connect box, e.g.
 `192.168.10.15:9001` (or `[fd00::15]:9001` for IPv6). An explicitly typed address wins over the
@@ -156,7 +156,7 @@ the gateway and that machine is the native RustDesk one.
 ```bat
 :: on the operator machine, with the same config directory the client uses
 rustdesk-webgate.exe
-:: then open http://<the address you bound>:<webgate-port>/ in a browser on a host in the allow-list
+:: then open http://<the address you bound>:<webgate-port>/ from a browser the guard allows
 ```
 
 The gateway refuses to start until all three of these are present under `[options]` in
@@ -179,14 +179,15 @@ What that buys you, and what it costs:
 - The browser-to-gateway hop is plain HTTP and WebSocket, **not TLS**, so run it on a trusted
   network segment. The gateway-to-controlled-machine hop keeps RustDesk's own handshake.
 - The page reaches the gateway over TCP, which is an inbound connection like any other, so the
-  **browser's own address must be in `intranet-allowlist.conf`** on the machine running the gateway
-  or the listener drops it (with an audit line).
+  **browser's address has to be allowed** on the machine running the gateway. With no narrowing that
+  means any private IPv4 address connects and everything else is dropped with an audit line; once
+  `intranet-allowlist.conf` names ranges, the browser has to fall inside one of them.
 - Frames are decoded and JPEG-encoded on the CPU. That is deliberate: the gateway has no GPU
   context, so it takes the RAM path rather than the texture path. Expect lower throughput than the
   desktop client, which is the price of having no plugin in the browser.
-- Everything the allow-list rules still apply to the address you type into the page. The gateway is
-  a `Session`, not a proxy: a target outside the allow-list is refused exactly as it would be in
-  the desktop client.
+- The same guard applies to the address you type into the page. The gateway is a `Session`, not a
+  proxy: a target it would refuse in the desktop client - public space, a host name, or a private
+  range the file has narrowed away - is refused here exactly the same way.
 
 ## Security boundaries
 
