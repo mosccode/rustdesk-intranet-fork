@@ -36,7 +36,7 @@ use hbb_common::rand::RngCore as _;
 use serde_json::json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{SyncReceiver, SyncSender};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -430,7 +430,7 @@ fn authenticated(text: &str, nonce: &[u8; 16], passphrase: &str) -> bool {
 }
 
 /// Push queued output to the browser, collapsing frames the browser has not caught up with.
-fn pump(_token: peer::Token, writer: Writer, rx: SyncReceiver<OutMsg>) {
+fn pump(_token: peer::Token, writer: Writer, rx: Receiver<OutMsg>) {
     loop {
         let next = match rx.recv() {
             Ok(msg) => msg,

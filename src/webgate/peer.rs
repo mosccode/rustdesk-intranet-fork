@@ -206,26 +206,21 @@ impl InvokeUiSession for WebUi {
         let quality = self.jpeg_quality();
         // Encode on this thread. A stalled browser drops frames in [`crate::webgate::http::push`]
         // instead of queueing old screens, so the page always shows the newest frame it can carry.
-        let mut pixels = rgba.raw[..expected].to_vec();
-        if swap_red_blue {
-            for px in pixels.chunks_exact_mut(4) {
-                px.swap(0, 2);
+        //
+        // The alpha byte is dropped by hand rather than through `image::RgbaImage`: jpeg takes
+        // `ColorType::Rgb8`, and building the packed buffer ourselves is one copy instead of two.
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for px in rgba.raw[..expected].chunks_exact(4) {
+            if swap_red_blue {
+                rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+            } else {
+                rgb.extend_from_slice(&px[..3]);
             }
         }
-        let Some(image) = image::RgbaImage::from_raw(w as u32, h as u32, pixels) else {
-            log::warn!("webgate: rgb buffer rejected by the image crate");
-            return;
-        };
-        let rgb = image.to_rgb8();
         let mut encoded = Vec::new();
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality);
         if encoder
-            .encode(
-                rgb.as_raw(),
-                rgb.width(),
-                rgb.height(),
-                image::ExtendedColorType::Rgb8,
-            )
+            .encode(&rgb, w as u32, h as u32, image::ColorType::Rgb8)
             .is_err()
         {
             log::warn!("webgate: jpeg encode failed");
@@ -650,8 +645,15 @@ fn dispatch(ui: &WebUi, session: Option<&Arc<Session<WebUi>>>, value: &Value) {
         }
         "view" => ui.toggle_if_needed("view-only", bool_field(value, "on")),
         "remote-cursor" => ui.toggle_if_needed("show-remote-cursor", bool_field(value, "on")),
-        "ctrlaltdel" => ui.with_session(|s| s.ctrl_alt_del()),
-        "lock" => ui.with_session(|s| s.lock_screen()),
+        "ctrlaltdel" => {
+            // The `with_session` arms are statements, not arm values: the helper answers `Option`
+            // so a command that arrives after the session is gone can be told apart from one that
+            // ran, and a dropped session has nothing left to do about a late ctrl-alt-del.
+            ui.with_session(|s| s.ctrl_alt_del());
+        }
+        "lock" => {
+            ui.with_session(|s| s.lock_screen());
+        }
         "select-session" => {
             let sid = int_field(value, "sid", 0).to_string();
             ui.with_session(|s| s.send_selected_session_id(sid));
