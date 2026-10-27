@@ -169,6 +169,11 @@ jobs:
       # No --locked: Cargo.lock still lists the removed dependencies and is rewritten here.
       - name: cargo build (release)
         run: cargo build --release --features flutter,hwcodec,vram --lib
+      # The browser control console is this fork's own binary and `--lib` does not build it.
+      # `src/webgate/index.html` is inlined into it by `include_str!`, so the string scan below
+      # covers the page as well as the code.
+      - name: cargo build webgate (release)
+        run: cargo build --release --features flutter,hwcodec,vram --bin rustdesk-webgate
       - name: flutter build windows
         run: cd flutter; flutter build windows --release
       - name: Build single-file portable
@@ -186,15 +191,17 @@ jobs:
         shell: bash
         run: |
           ls -l target/release/librustdesk.dll
+          ls -l target/release/rustdesk-webgate.exe
           ls -l flutter/build/windows/x64/runner/Release
       - name: Scan artifact strings
-        run: python scripts/scan_strings.py target/release/librustdesk.dll flutter/build/windows/x64/runner/Release/data/app.so flutter/build/windows/x64/runner/Release/rustdesk.exe
+        run: python scripts/scan_strings.py target/release/librustdesk.dll target/release/rustdesk-webgate.exe flutter/build/windows/x64/runner/Release/data/app.so flutter/build/windows/x64/runner/Release/rustdesk.exe
       - name: Upload windows build
         uses: actions/upload-artifact@v4
         with:
           name: rustdesk-windows-release
           path: |
             target/release/librustdesk.dll
+            target/release/rustdesk-webgate.exe
             flutter/build/windows/x64/runner/Release
             rustdesk-intranet-1.5.0-x86_64.exe
           retention-days: 7
@@ -205,6 +212,9 @@ jobs:
           mkdir -p dist/rustdesk-intranet
           cp -r flutter/build/windows/x64/runner/Release dist/rustdesk-intranet/
           cp target/release/librustdesk.dll dist/rustdesk-intranet/Release/
+          # Linked statically like the other bins, so it needs no dll; it shares the client's
+          # config directory, which is where the allow-list and `webgate-*` options live.
+          cp target/release/rustdesk-webgate.exe dist/rustdesk-intranet/Release/
           cp LICENCE NOTICE MODIFICATIONS.md README.md dist/rustdesk-intranet/
           cp rustdesk-intranet-1.5.0-x86_64.exe dist/
           cd dist && 7z a -tzip rustdesk-intranet-windows-x64.zip rustdesk-intranet
@@ -214,4 +224,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}"             dist/rustdesk-intranet-windows-x64.zip             dist/rustdesk-intranet-1.5.0-x86_64.exe             --title "${{ github.ref_name }}"             --notes "Windows x64 builds from source at ${{ github.sha }}. rustdesk-intranet-1.5.0-x86_64.exe is a single-file portable build; the zip is the full directory. Configure your intranet ranges in intranet-allowlist.conf; see README."
+          gh release create "${{ github.ref_name }}"             dist/rustdesk-intranet-windows-x64.zip             dist/rustdesk-intranet-1.5.0-x86_64.exe             --title "${{ github.ref_name }}"             --notes "Windows x64 builds from source at ${{ github.sha }}. rustdesk-intranet-1.5.0-x86_64.exe is a single-file portable build; the zip is the full directory and also contains rustdesk-webgate.exe, the browser control console (see README). Configure your intranet ranges in intranet-allowlist.conf."

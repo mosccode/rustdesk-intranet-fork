@@ -44,6 +44,7 @@ Build from source (same steps as CI):
 cargo check --features flutter,linux-pkg-config --lib --bins
 # Windows release (Visual Studio 2022 + LLVM + vcpkg with libvpx/libyuv/opus/aom)
 cargo build --release --features flutter,hwcodec,vram --lib
+cargo build --release --features flutter,hwcodec,vram --bin rustdesk-webgate
 cd flutter && flutter build windows --release
 ```
 
@@ -74,6 +75,74 @@ nothing is reachable; that is the default.
 Every refused target is appended to `netguard-audit.log` in the same directory, and mirrored to
 the normal application log.
 
+### Direct connection port
+
+Upstream dials port `21118` for a direct connection and listens there on the controlled machine,
+and the two halves used to read the port from different places, so changing only one side silently
+broke connectivity. In this fork both halves call one function
+(`hbb_common::netguard::direct_peer_port()`), so a single option moves the pair together.
+
+Set it in the settings page (Security / Direct access port) or in
+`RustDesk2.toml` under `[options]`:
+
+```toml
+direct-access-port = "9001"
+```
+
+Both sides must be configured the same way, and the controlled machine has to be restarted for the
+listener to move. Leaving the option unset keeps `21118`. A value that is not a number in
+`1-65535` is refused at startup with an explanation instead of quietly falling back, because a
+silently wrong port is indistinguishable from a firewall problem on site.
+
+The port is a port, not a destination: it cannot widen the allow-list, every dial still has to
+match `intranet-allowlist.conf`.
+
+You can also override the port per connection by typing it into the connect box, e.g.
+`192.168.10.15:9001` (or `[fd00::15]:9001` for IPv6). An explicitly typed address wins over the
+option, which is useful for reaching a peer that has not moved its listener.
+
+## Browser control console (`rustdesk-webgate`)
+
+The zip also contains `rustdesk-webgate.exe`: a small listener that serves one HTML page and
+drives a normal RustDesk session on your behalf. It is a **control end only** - the machine being
+controlled runs the ordinary client and gains no new inbound port, and the wire protocol between
+the gateway and that machine is the native RustDesk one.
+
+```bat
+:: on the operator machine, with the same config directory the client uses
+rustdesk-webgate.exe
+:: then open http://<the address you bound>:<webgate-port>/ in a browser on a host in the allow-list
+```
+
+The gateway refuses to start until all three of these are present under `[options]` in
+`RustDesk2.toml`; none of them is compiled in, and there is no default bind address:
+
+```toml
+webgate = "Y"
+webgate-bind = "192.168.10.20"
+webgate-passphrase = "operator passphrase"
+# optional
+webgate-port = "21124"
+webgate-jpeg-quality = "70"
+```
+
+What that buys you, and what it costs:
+
+- The browser proves knowledge of the passphrase with `sha1(nonce || passphrase)` over a nonce the
+  gateway generates per connection, so the passphrase itself never crosses the socket. This is
+  authentication of the operator, not a secret shared with the peer.
+- The browser-to-gateway hop is plain HTTP and WebSocket, **not TLS**, so run it on a trusted
+  network segment. The gateway-to-controlled-machine hop keeps RustDesk's own handshake.
+- The page reaches the gateway over TCP, which is an inbound connection like any other, so the
+  **browser's own address must be in `intranet-allowlist.conf`** on the machine running the gateway
+  or the listener drops it (with an audit line).
+- Frames are decoded and JPEG-encoded on the CPU. That is deliberate: the gateway has no GPU
+  context, so it takes the RAM path rather than the texture path. Expect lower throughput than the
+  desktop client, which is the price of having no plugin in the browser.
+- Everything the allow-list rules still apply to the address you type into the page. The gateway is
+  a `Session`, not a proxy: a target outside the allow-list is refused exactly as it would be in
+  the desktop client.
+
 ## Security boundaries
 
 - This is a code-level restriction of the application's own network behavior. It does not claim
@@ -83,7 +152,9 @@ the normal application log.
 - The code has not been audited by a third party. Treat it as an engineering change, not a
   security certification.
 - Only direct IP connections are supported. There is no ID-based lookup, relay, file transfer
-  server, web client or cloud account.
+  server, hosted web client or cloud account. The browser page in
+  [`src/webgate/`](src/webgate/) is a local control console you run yourself; it is not a hosted
+  client and it does not change what the controlled machine listens for.
 
 ## License
 

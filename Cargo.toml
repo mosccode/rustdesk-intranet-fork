@@ -20,6 +20,13 @@ path = "src/naming.rs"
 name = "service"
 path = "src/service.rs"
 
+# The browser control console: this fork's own control end (`Session`) with a WebSocket in place of
+# a window. It is a separate binary because it must not carry a tray, an updater, or a server loop,
+# and because `webgate::run()` blocks serving forever.
+[[bin]]
+name = "rustdesk-webgate"
+path = "src/bin_webgate.rs"
+
 [features]
 inline = []
 use_samplerate = ["samplerate", "libsamplerate-sys"]

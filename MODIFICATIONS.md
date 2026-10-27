@@ -26,9 +26,25 @@ required by AGPL-3.0 section 5(a). Modifications are dated 2026-10.
 ## Configuration and UI
 
 - Added the intranet allow-list file and its commented template.
+- Made the direct-connection port operator-settable: both the listener and the dial now read one
+  option (`direct-access-port`) through a single `netguard::direct_peer_port()`, so the two ends
+  cannot drift apart. The default is still `21118`.
 - Removed the ID/relay server dialog, proxy dialog, WebSocket switch, server test action,
   `id@server` handling and the "change ID" action.
 - Removed vendor URLs from in-app help/about links.
+- Replaced the ID board and connection-status widget on the desktop home page with the machine's
+  own reachable direct-access address and an intranet-mode status line.
+
+## Control ends
+
+- Added `src/webgate/` and the `rustdesk-webgate` binary: a browser control console. It serves one
+  page and speaks the native protocol to the controlled machine by reusing `Session`, so the
+  controlled side is unchanged and listens on the same port it always did.
+- Everything it can be told to do is filtered by the same allow-list the desktop client uses; the
+  listener itself refuses to start without an explicit bind address and passphrase, and accepts
+  peers only from allow-listed addresses.
+- Added `src/webgate/sha1.rs` (RFC 6455 handshake) and `src/webgate/http.rs` (HTTP/1.1 + WebSocket
+  framing) rather than adding crate dependencies to this build.
 
 ## Build
 

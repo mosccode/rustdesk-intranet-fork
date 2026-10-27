@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>内网远程控制台</title>
+<!--
+  The webgate page. It is inlined into the gateway binary and served with
+  `Content-Security-Policy: default-src 'none'`, so this file must contain no external URL, no font
+  reference, and no script src - if it did, the browser would refuse to load it and the console would
+  look broken in a way that is hard to diagnose from the operator's side.
+
+  Two browser capabilities are deliberately not used, because the page is served over `http://<ip>`
+  which is NOT a secure context: `crypto.subtle` (no SHA-256, so SHA-1 is implemented below) and
+  `navigator.clipboard` (so clipboard access is a button plus an editable field, not a silent read).
+-->
+<style>
+  :root {
+    --bg: #14171a;
+    --panel: #1d2126;
+    --line: #2c323a;
+    --ink: #dfe3e8;
+    --dim: #8b97a5;
+    --teal: #2f8f83;
+    --teal-dim: #245f58;
+    --bad: #c8553d;
+    --ok: #4c9f70;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 13px/1.5 "Microsoft YaHei", "PingFang SC", sans-serif;
+  }
+  header, footer {
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    padding: 8px 12px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  }
+  footer { border-bottom: 0; border-top: 1px solid var(--line); }
+  h1 { font-size: 14px; margin: 0 12px 0 0; font-weight: 600; letter-spacing: .02em; }
+  label { color: var(--dim); }
+  input, select, textarea, button {
+    font: inherit; color: var(--ink); background: #12151a;
+    border: 1px solid var(--line); border-radius: 3px; padding: 4px 7px;
+  }
+  input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible {
+    outline: 2px solid var(--teal); outline-offset: 1px;
+  }
+  input[type=checkbox] { padding: 0; accent-color: var(--teal); }
+  #addr { width: 22ch; }
+  #pass { width: 18ch; }
+  button { cursor: pointer; background: var(--teal-dim); border-color: var(--teal); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.plain { background: #12151a; border-color: var(--line); }
+  #stage {
+    position: relative; background: #000; margin: 0 auto;
+    display: flex; align-items: center; justify-content: center;
+    height: calc(100vh - 176px); min-height: 240px; overflow: hidden;
+    outline: none;
+  }
+  #stage:focus-visible { box-shadow: inset 0 0 0 2px var(--teal); }
+  #screen { max-width: 100%; max-height: 100%; display: block; }
+  #cursor { position: absolute; left: 0; top: 0; pointer-events: none; display: none; }
+  #placeholder {
+    position: absolute; color: var(--dim); text-align: center; padding: 0 24px; max-width: 62ch;
+  }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; color: var(--dim); }
+  .chip.on { color: var(--ink); border-color: var(--teal); }
+  #state.idle { color: var(--dim); }
+  #state.busy { color: var(--ok); }
+  #state.bad { color: var(--bad); }
+  #log {
+    height: 5em; overflow-y: auto; flex: 1 1 40ch; min-width: 24ch;
+    background: #12151a; border: 1px solid var(--line); border-radius: 3px;
+    padding: 4px 7px; color: var(--dim); font-size: 12px; white-space: pre-wrap;
+  }
+  dialog {
+    background: var(--panel); color: var(--ink); border: 1px solid var(--teal);
+    border-radius: 4px; padding: 14px 16px; max-width: 46ch;
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, .6); }
+  dialog form { display: flex; flex-direction: column; gap: 10px; }
+  dialog menu { display: flex; gap: 8px; justify-content: flex-end; margin: 0; padding: 0; border: 0; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .hidden { display: none !important; }
+  #clip { width: 100%; min-height: 4.5em; resize: vertical; }
+</style>
+</head>
+<body>
+<header>
+  <h1>内网远程控制台</h1>
+  <label for="addr">地址</label>
+  <input id="addr" placeholder="10.0.12.34:9001" autocomplete="off" spellcheck="false">
+  <label for="pass">密码</label>
+  <input id="pass" type="password" autocomplete="off">
+  <label><input id="view" type="checkbox"> 只观看</label>
+  <button id="connect">连接</button>
+  <button id="disconnect" class="plain" disabled>断开</button>
+  <span class="chips">
+    <span id="state" class="chip idle">未连接</span>
+    <span id="fps" class="chip">— fps</span>
+    <span id="geomChip" class="chip">—</span>
+    <span id="sec" class="chip">传输未建立</span>
+  </span>
+</header>
+
+<div id="stage" tabindex="0">
+  <img id="screen" alt="远端屏幕" class="hidden">
+  <img id="cursor" alt="">
+  <p id="placeholder">输入被控端的字面 IP（可带端口）与密码后点「连接」。<br>
+    画面与键鼠经由本机网关转发，不经过任何公网地址；此页面自身不加载任何外部资源。</p>
+</div>
+
+<footer>
+  <div class="row">
+    <label for="disp">显示器</label><select id="disp"><option value="0">0</option></select>
+    <button id="refresh" class="plain">刷新画面</button>
+    <label for="quality">画质</label>
+    <select id="quality">
+      <option value="best">最佳</option>
+      <option value="balanced" selected>均衡</option>
+      <option value="low">流畅</option>
+      <option value="custom">自定义</option>
+    </select>
+    <label for="cq">自定义质量</label><input id="cq" type="number" min="10" max="100" value="80" style="width:6ch">
+    <label for="fpsIn">FPS</label><input id="fpsIn" type="number" min="1" max="120" value="30" style="width:5ch">
+    <label><input id="remoteCursor" type="checkbox"> 显示远端光标</label>
+    <button id="ctrlaltdel" class="plain">Ctrl+Alt+Del</button>
+    <button id="lock" class="plain">锁定屏幕</button>
+    <button id="release" class="plain">释放修饰键</button>
+  </div>
+  <div class="row">
+    <label for="textIn">输入文本（含中文）</label>
+    <input id="textIn" placeholder="粘贴或输入后要发往远端的文本" style="flex:1 1 24ch">
+    <button id="sendText">发送</button>
+  </div>
+  <div class="row" style="flex:1 1 100%">
+    <textarea id="clip" placeholder="剪贴板：从这里发往远端，或点「取回远端」把远端内容读到这里"></textarea>
+    <div class="row" style="flex-direction:column">
+      <button id="clipPush" class="plain">发送到远端</button>
+      <button id="clipPull" class="plain">取回远端</button>
+    </div>
+    <div id="log" role="log" aria-live="polite"></div>
+  </div>
+</footer>
+
+<dialog id="prompt">
+  <!-- Not `method="dialog"`: pressing Enter in the password field has to run the same callback the
+       确定 button runs, and a dialog-form submit closes the dialog without reaching either handler. -->
+  <form id="promptForm">
+    <p id="promptTitle" style="margin:0;font-weight:600"></p>
+    <p id="promptText" style="margin:0;color:var(--dim)"></p>
+    <input id="promptInput" type="password" placeholder="密码" autocomplete="off" spellcheck="false" class="hidden">
+    <menu>
+      <button id="promptNo" type="button" class="plain">取消</button>
+      <button id="promptYes" type="submit">确定</button>
+    </menu>
+  </form>
+</dialog>
+
+<script>
+'use strict';
+// ---------------------------------------------------------------------------
+// SHA-1, written out. The page is served over http://<ip>, which is not a secure context, so
+// `crypto.subtle` is unavailable there; the passphrase proof in `onopen` is the only hash needed.
+// Input is bytes, output is 20 bytes. It is a digest, not a KDF - see the module's security note.
+// ---------------------------------------------------------------------------
+function sha1Bytes(bytes) {
+  const ml = bytes.length;
+  const withOne = ml + 1;
+  const padded = new Uint8Array((Math.ceil((withOne + 8) / 64) * 64) || 64);
+  padded.set(bytes);
+  padded[ml] = 0x80;
+  const bitLenHi = Math.floor(ml / 536870912);
+  const bitLenLo = (ml * 8) >>> 0;
+  const view = new DataView(padded.buffer);
+  view.setUint32(padded.length - 8, bitLenHi, false);
+  view.setUint32(padded.length - 4, bitLenLo, false);
+
+  let h0 = 0x67452301, h1 = 0xEFCDAB89, h2 = 0x98BADCFE, h3 = 0x10325476, h4 = 0xC3D2E1F0;
+  const w = new Int32Array(80);
+  const rotl = (v, n) => (v << n) | (v >>> (32 - n));
+
+  for (let chunk = 0; chunk < padded.length; chunk += 64) {
+    for (let i = 0; i < 16; i++) w[i] = view.getInt32(chunk + i * 4, false);
+    for (let i = 16; i < 80; i++) w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    let a = h0, b = h1, c = h2, d = h3, e = h4;
+    for (let i = 0; i < 80; i++) {
+      let f, k;
+      if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; }
+      else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+      else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+      else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+      const temp = (rotl(a, 5) + (f >>> 0) + e + k + w[i]) >>> 0;
+      e = d; d = c; c = rotl(b, 30); b = a; a = temp;
+    }
+    h0 = (h0 + a) >>> 0; h1 = (h1 + b) >>> 0; h2 = (h2 + c) >>> 0;
+    h3 = (h3 + d) >>> 0; h4 = (h4 + e) >>> 0;
+  }
+  const out = new Uint8Array(20);
+  const outView = new DataView(out.buffer);
+  [h0, h1, h2, h3, h4].forEach((h, i) => outView.setUint32(i * 4, h, false));
+  return out;
+}
+
+function bytesToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary);
+}
+
+function base64ToBytes(text) {
+  const binary = atob(text);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+function utf8(text) {
+  return new TextEncoder().encode(text);
+}
+
+// ---------------------------------------------------------------------------
+// The page's own state; nothing here outlives a reload.
+// ---------------------------------------------------------------------------
+const ui = {
+  stage: document.getElementById('stage'),
+  screen: document.getElementById('screen'),
+  cursor: document.getElementById('cursor'),
+  placeholder: document.getElementById('placeholder'),
+  state: document.getElementById('state'),
+  fps: document.getElementById('fps'),
+  geomChip: document.getElementById('geomChip'),
+  sec: document.getElementById('sec'),
+  log: document.getElementById('log'),
+  addr: document.getElementById('addr'),
+  pass: document.getElementById('pass'),
+  view: document.getElementById('view'),
+  connect: document.getElementById('connect'),
+  disconnect: document.getElementById('disconnect'),
+  disp: document.getElementById('disp'),
+  quality: document.getElementById('quality'),
+  remoteCursor: document.getElementById('remoteCursor'),
+  clip: document.getElementById('clip'),
+  prompt: document.getElementById('prompt'),
+  promptForm: document.getElementById('promptForm'),
+  promptTitle: document.getElementById('promptTitle'),
+  promptText: document.getElementById('promptText'),
+  promptInput: document.getElementById('promptInput'),
+  refresh: document.getElementById('refresh'),
+};
+const wsState = { socket: null, nonce: null, geom: { w: 0, h: 0 }, connected: false };
+// `shapes` maps a cursor id to `{ image, hotx, hoty }`, exactly the triple the gateway sends in a
+// `cursor` event; the hotspot is what makes the drawn pointer line up with where clicks land.
+const cursorState = { shapes: new Map(), id: '0', x: 0, y: 0, embedded: false, wanted: true };
+const pressed = { keys: new Set(), buttons: new Set() };
+
+function say(text) {
+  const line = document.createElement('div');
+  line.textContent = new Date().toLocaleTimeString() + '  ' + text;
+  ui.log.appendChild(line);
+  while (ui.log.childElementCount > 200) ui.log.removeChild(ui.log.firstElementChild);
+  ui.log.scrollTop = ui.log.scrollHeight;
+}
+
+function setState(text, kind) {
+  ui.state.textContent = text;
+  ui.state.className = 'chip ' + (kind || 'idle');
+}
+
+function send(object) {
+  if (!wsState.socket || wsState.socket.readyState !== WebSocket.OPEN) return false;
+  wsState.socket.send(JSON.stringify(object));
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// The bridge
+// ---------------------------------------------------------------------------
+function connectBridge() {
+  const url = 'ws://' + location.host + '/ws';
+  let socket;
+  try {
+    socket = new WebSocket(url);
+  } catch (e) {
+    say('无法打开到网关的连接：' + e.message);
+    return;
+  }
+  socket.binaryType = 'arraybuffer';
+  wsState.socket = socket;
+
+  socket.onopen = () => {
+    if (!wsState.nonce) return; // hello has not arrived yet; onmessage will do the proof
+  };
+  socket.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) { showFrame(event.data); return; }
+    let message;
+    try { message = JSON.parse(event.data); } catch (e) { say('忽略了一条无法解析的网关消息。'); return; }
+    handleEvent(message);
+  };
+  socket.onerror = () => say('与网关的连接出错。');
+  socket.onclose = (event) => {
+    clearInterval(keepalive);
+    wsState.nonce = null;
+    wsState.connected = false;
+    setState('未连接', 'idle');
+    ui.connect.disabled = false;
+    ui.disconnect.disabled = true;
+    ui.sec.textContent = '传输未建立';
+    if (!event.wasClean) say('网关连接已关闭（代码 ' + event.code + '）。');
+  };
+  // The gateway drops a socket that hears nothing for 300 s (http.rs `READ_TIMEOUT`), and a static
+  // remote screen means the browser really does send nothing: no mouse moves, no keystrokes. Pinging
+  // well inside that window keeps an idle session alive without the operator touching anything.
+  const keepalive = setInterval(() => send({ t: 'ping' }), 120_000);
+}
+
+function handleEvent(message) {
+  switch (message.t) {
+    case 'hello':
+      wsState.nonce = message.nonce;
+      if (message.peer_port) {
+        // Prefill only when the operator has not typed anything, so a deliberate address survives.
+        if (!ui.addr.value) ui.addr.placeholder = '10.0.12.34:' + message.peer_port;
+      }
+      proof();
+      return;
+    case 'state':
+      if (message.s === 'connecting') setState('连接中', 'busy');
+      else if (message.s === 'connected') { setState('已连接', 'busy'); wsState.connected = true; }
+      else if (message.s === 'closing') setState('正在关闭', 'idle');
+      else if (message.s === 'disconnected') { setState('已断开', 'idle'); wsState.connected = false; }
+      else if (message.s === 'busy') { setState('网关被占用', 'bad'); say(message.msg || '另一个标签页正在使用本网关。'); }
+      else if (message.s === 'auth-ok') setState('已验证，待连接', 'busy');
+      if (message.msg) say(message.msg);
+      return;
+    case 'geom':
+      wsState.geom = { w: message.w || 0, h: message.h || 0 };
+      ui.geomChip.textContent = wsState.geom.w + '×' + wsState.geom.h;
+      cursorState.embedded = !!message.embedded;
+      updateCursorVisibility();
+      return;
+    case 'displays':
+      ui.disp.innerHTML = '';
+      (message.list || []).forEach((d) => {
+        const option = document.createElement('option');
+        option.value = String(d.i);
+        option.textContent = d.i + ' · ' + (d.name || '显示器') + ' · ' + d.w + '×' + d.h + (d.online ? '' : '（离线）');
+        ui.disp.appendChild(option);
+      });
+      if (!ui.disp.childElementCount) {
+        ui.disp.innerHTML = '<option value="0">0</option>';
+      }
+      return;
+    case 'cursor': {
+      // A `cursor` event both defines a shape and makes it the current one - the same thing the
+      // Flutter handler does with `_cursorId = cd.id` after `setCursorData`.
+      const shape = {
+        image: new Image(),
+        hotx: message.hotx || 0,
+        hoty: message.hoty || 0,
+      };
+      cursorState.id = message.id;
+      shape.image.onload = () => {
+        cursorState.shapes.set(message.id, shape);
+        paintCursor();
+      };
+      shape.image.src = 'data:image/png;base64,' + message.png;
+      return;
+    }
+    case 'cursor-id':
+      // The peer selects a shape it has already sent; switching is the whole message, so the page
+      // must not wait for a resend.
+      cursorState.id = message.id;
+      paintCursor();
+      return;
+    case 'cursor-pos':
+      cursorState.x = message.x || 0;
+      cursorState.y = message.y || 0;
+      cursorState.embedded = !!message.embedded;
+      paintCursor();
+      return;
+    case 'info':
+      say('已连上 ' + (message.hostname || '?') + '（' + (message.platform || '?') + ' · ' + (message.username || '?') + ' · 版本 ' + (message.version || '?') + '）。');
+      return;
+    case 'transport':
+      ui.sec.textContent = (message.secured ? '会话已加密' : '会话未加密') + ' · ' + (message.direct ? '直连' : '非直连') + ' · ' + (message.stream || '?');
+      ui.sec.className = 'chip ' + (message.secured ? 'on' : '');
+      return;
+    case 'fingerprint':
+      say('对端指纹：' + message.value);
+      return;
+    case 'stat':
+      ui.fps.textContent = (message.fps || 0) + ' fps · ' + (message.speed || '—') + ' · ' + (message.delay || 0) + 'ms';
+      return;
+    case 'perm':
+      say('对端权限 ' + message.name + '：' + (message.on ? '允许' : '禁止') + '。');
+      if (message.name === 'keyboard' && message.on === false) say('键盘输入已被对端禁止。');
+      return;
+    case 'block-input':
+      say('对端' + (message.on ? '锁定' : '解锁') + '了本地输入。');
+      return;
+    case 'recording':
+      say('会话录制：' + (message.on ? '开始' : '结束') + '。');
+      return;
+    case 'settings':
+      if (typeof message.view === 'boolean') ui.view.checked = message.view;
+      return;
+    case 'sessions': {
+      const names = (message.list || []).map((s) => s.sid + '·' + s.name).join('，');
+      const yes = window.confirm('对端有多个登录会话：' + names + '\n\n确定使用第一个，取消则不切换。');
+      if (yes && message.list && message.list.length) {
+        send({ t: 'select-session', sid: message.list[0].sid });
+      }
+      return;
+    }
+    case 'clip':
+      ui.clip.value = message.text || '';
+      say('已取回远端剪贴板（' + (message.text || '').length + ' 字符）。');
+      return;
+    case 'chat':
+      say('对端消息：' + message.text);
+      return;
+    case 'msg':
+      say(message.text);
+      return;
+    // The peer withdrew the prompt it sent, so an open dialog is now answering nothing: drop it.
+    // Only one dialog exists in this page, and the gateway only cancels the prompt it just asked
+    // for, so there is no second prompt to mistake it for.
+    case 'msgbox-cancel':
+      if (ui.prompt.open) ui.prompt.close();
+      return;
+    case 'pong':
+      return;
+    case 'closed':
+      say('网关关闭连接：' + (message.reason || '未说明'));
+      return;
+    case 'msgbox':
+      askMessage(message);
+      return;
+    default:
+      say('未处理的消息类型：' + message.t);
+  }
+}
+
+// The password prompts, the insecure-connection prompt and plain errors all arrive as `msgbox`.
+function askMessage(message) {
+  const type = message.type || 'error';
+  if (type === 'input-password' || type === 're-input-password') {
+    // The password is typed in the dialog, not in the connect form: the modal makes everything
+    // behind it inert, so the form field would be unreachable at exactly the moment the peer asks.
+    showPrompt(message.title || '需要密码', message.text || '被控端要求输入密码。', { input: 'password' }, (password) => {
+      if (!password) { say('没有输入密码，未发送。'); return; }
+      ui.pass.value = password;
+      send({ t: 'login', password: password });
+    });
+    return;
+  }
+  if (type.indexOf('insecure-connection') === 0) {
+    showPrompt(message.title || '不安全连接', message.text || '对端无法建立端到端加密。', { withCancel: true }, (yes) => {
+      send({ t: 'insecure', yes: !!yes });
+    });
+    return;
+  }
+  if (type === 'restarting' || type === 'wait-remote-accept-nook') {
+    say((message.title || '提示') + '：' + (message.text || ''));
+    return;
+  }
+  showPrompt(message.title || '提示', message.text || '', { withCancel: type === 'question' || type.indexOf('insecure') >= 0 }, (yes) => {
+    if (type.indexOf('insecure') >= 0) send({ t: 'insecure', yes: !!yes });
+  });
+}
+
+function showPrompt(title, text, options, onAnswer) {
+  const withCancel = !!(options && options.withCancel);
+  const withInput = !!(options && options.input);
+  ui.promptTitle.textContent = title;
+  ui.promptText.textContent = text;
+  ui.promptInput.value = '';
+  ui.promptInput.placeholder = (options && options.input) === 'passphrase' ? '网关口令' : '密码';
+  ui.promptInput.classList.toggle('hidden', !withInput);
+  const no = document.getElementById('promptNo');
+  const yes = document.getElementById('promptYes');
+  no.classList.toggle('hidden', !withCancel);
+  const close = () => ui.prompt.close();
+  const accept = () => {
+    onAnswer(withInput ? ui.promptInput.value : true);
+    close();
+  };
+  // Enter submits the form; a submit on a plain form would navigate the page, so it is prevented and
+  // routed to the same handler the 确定 button uses.
+  ui.promptForm.onsubmit = (event) => { event.preventDefault(); accept(); };
+  yes.onclick = (event) => { event.preventDefault(); accept(); };
+  no.onclick = (event) => { event.preventDefault(); onAnswer(false); close(); };
+  ui.prompt.showModal();
+  if (withInput) ui.promptInput.focus();
+}
+
+function proof() {
+  // `showPrompt` rather than `window.prompt`: the browser's own box echoes the passphrase in clear
+  // text, and this one masks it. The gateway gives up 30 seconds after `hello`, so say that here.
+  showPrompt('网关口令', '输入本网关的 webgate-passphrase 以通过校验。口令只在本机算摘要，不会发到网络上。网关等待 30 秒。', { input: 'passphrase' }, (phrase) => {
+    if (!phrase) {
+      say('没有口令，无法通过网关验证。');
+      if (wsState.socket) wsState.socket.close();
+      return;
+    }
+    const digest = sha1Bytes(concat(base64ToBytes(wsState.nonce), utf8(phrase)));
+    send({ t: 'auth', d: bytesToBase64(digest) });
+  });
+}
+
+function concat(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a); out.set(b, a.length);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Video
+// ---------------------------------------------------------------------------
+let lastFrameUrl = '';
+function showFrame(buffer) {
+  if (!buffer || !buffer.byteLength) return;
+  const url = URL.createObjectURL(new Blob([buffer], { type: 'image/jpeg' }));
+  const next = new Image();
+  next.onload = () => {
+    ui.screen.src = url;
+    ui.screen.classList.remove('hidden');
+    ui.placeholder.classList.add('hidden');
+    paintCursor();
+    if (lastFrameUrl) URL.revokeObjectURL(lastFrameUrl);
+    lastFrameUrl = url;
+  };
+  next.onerror = () => URL.revokeObjectURL(url);
+  next.src = url;
+}
+
+// ---------------------------------------------------------------------------
+// Pointer
+// ---------------------------------------------------------------------------
+function remotePoint(event) {
+  const box = ui.screen.classList.contains('hidden')
+    ? ui.stage.getBoundingClientRect()
+    : ui.screen.getBoundingClientRect();
+  const geom = wsState.geom;
+  if (!geom.w || !geom.h || box.width <= 0 || box.height <= 0) return null;
+  const x = Math.round((event.clientX - box.left) / box.width * geom.w);
+  const y = Math.round((event.clientY - box.top) / box.height * geom.h);
+  return { x: clamp(x, 0, geom.w - 1), y: clamp(y, 0, geom.h - 1) };
+}
+
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+const buttonNames = ['left', 'right', 'wheel', 'middle', 'back', 'forward'];
+function buttonName(event) {
+  const b = event.button;
+  if (b === 1) return 'middle';
+  if (b === 2) return 'right';
+  if (b === 3) return 'back';
+  if (b === 4) return 'forward';
+  return 'left';
+}
+
+function mouseEvent(event, type, button) {
+  const point = remotePoint(event);
+  if (!point) return;
+  send({
+    t: 'mouse', type: type, x: point.x, y: point.y,
+    button: button || 'left',
+    alt: event.altKey, ctrl: event.ctrlKey, shift: event.shiftKey, meta: event.metaKey,
+  });
+}
+
+ui.stage.addEventListener('pointerdown', (event) => {
+  if (!wsState.connected || ui.view.checked) return;
+  ui.stage.focus();
+  ui.stage.setPointerCapture(event.pointerId);
+  pressed.buttons.add(buttonName(event));
+  mouseEvent(event, 'down', buttonName(event));
+  event.preventDefault();
+});
+ui.stage.addEventListener('pointerup', (event) => {
+  if (!wsState.connected || ui.view.checked) return;
+  const name = buttonName(event);
+  pressed.buttons.delete(name);
+  mouseEvent(event, 'up', name);
+  event.preventDefault();
+});
+ui.stage.addEventListener('pointermove', (event) => {
+  if (!wsState.connected) return;
+  mouseEvent(event, 'move', 'none');
+});
+ui.stage.addEventListener('wheel', (event) => {
+  if (!wsState.connected || ui.view.checked) return;
+  event.preventDefault();
+  const point = remotePoint(event);
+  if (!point) return;
+  send({ t: 'mouse', type: 'wheel', x: 0, y: Math.round(event.deltaY), button: 'none' });
+}, { passive: false });
+ui.stage.addEventListener('contextmenu', (event) => event.preventDefault());
+// A tab that loses focus or the network must not leave a button held down on the peer.
+window.addEventListener('blur', releaseAll);
+
+// ---------------------------------------------------------------------------
+// Keyboard
+// ---------------------------------------------------------------------------
+// `KeyboardEvent.code` is a physical position; the gateway's `KEY_MAP` speaks Windows virtual-key
+// names. Only names present in that table are forwarded - anything else is ignored rather than
+// guessed at, because a wrong name silently does nothing on the peer. `NumLock` is deliberately
+// absent: `KEY_MAP` has no `VK_NUMLOCK`, so the table above is the only source of truth here.
+const vkNames = {
+  KeyA: 'VK_A', KeyB: 'VK_B', KeyC: 'VK_C', KeyD: 'VK_D', KeyE: 'VK_E', KeyF: 'VK_F',
+  KeyG: 'VK_G', KeyH: 'VK_H', KeyI: 'VK_I', KeyJ: 'VK_J', KeyK: 'VK_K', KeyL: 'VK_L',
+  KeyM: 'VK_M', KeyN: 'VK_N', KeyO: 'VK_O', KeyP: 'VK_P', KeyQ: 'VK_Q', KeyR: 'VK_R',
+  KeyS: 'VK_S', KeyT: 'VK_T', KeyU: 'VK_U', KeyV: 'VK_V', KeyW: 'VK_W', KeyX: 'VK_X',
+  KeyY: 'VK_Y', KeyZ: 'VK_Z',
+  Digit0: 'VK_0', Digit1: 'VK_1', Digit2: 'VK_2', Digit3: 'VK_3', Digit4: 'VK_4',
+  Digit5: 'VK_5', Digit6: 'VK_6', Digit7: 'VK_7', Digit8: 'VK_8', Digit9: 'VK_9',
+  Numpad0: 'VK_NUMPAD0', Numpad1: 'VK_NUMPAD1', Numpad2: 'VK_NUMPAD2', Numpad3: 'VK_NUMPAD3',
+  Numpad4: 'VK_NUMPAD4', Numpad5: 'VK_NUMPAD5', Numpad6: 'VK_NUMPAD6', Numpad7: 'VK_NUMPAD7',
+  Numpad8: 'VK_NUMPAD8', Numpad9: 'VK_NUMPAD9',
+  NumpadAdd: 'VK_ADD', NumpadSubtract: 'VK_SUBTRACT', NumpadMultiply: 'VK_MULTIPLY',
+  NumpadDivide: 'VK_DIVIDE', NumpadDecimal: 'VK_DECIMAL', NumpadEnter: 'VK_RETURN',
+  Comma: 'VK_COMMA', Slash: 'VK_SLASH', Semicolon: 'VK_SEMICOLON', Quote: 'VK_QUOTE',
+  BracketLeft: 'VK_LBRACKET', BracketRight: 'VK_RBRACKET', Backslash: 'VK_BACKSLASH',
+  Minus: 'VK_MINUS', Equal: 'VK_PLUS', IntlBackslash: 'VK_BACKSLASH',
+  ArrowUp: 'VK_UP', ArrowDown: 'VK_DOWN', ArrowLeft: 'VK_LEFT', ArrowRight: 'VK_RIGHT',
+  PageUp: 'VK_PRIOR', PageDown: 'VK_NEXT', Home: 'VK_HOME', End: 'VK_END',
+  Insert: 'VK_INSERT', Delete: 'VK_DELETE', Backspace: 'VK_BACK',
+  Enter: 'VK_RETURN', Escape: 'VK_ESCAPE', Tab: 'VK_TAB', Space: 'VK_SPACE',
+  CapsLock: 'VK_CAPITAL', ScrollLock: 'VK_SCROLL',
+  PrintScreen: 'VK_SNAPSHOT', Pause: 'VK_PAUSE', ContextMenu: 'VK_SELECT',
+  ShiftLeft: 'VK_SHIFT', ShiftRight: 'VK_SHIFT',
+  ControlLeft: 'VK_CONTROL', ControlRight: 'VK_CONTROL',
+  AltLeft: 'VK_MENU', AltRight: 'VK_MENU',
+  F1: 'VK_F1', F2: 'VK_F2', F3: 'VK_F3', F4: 'VK_F4', F5: 'VK_F5', F6: 'VK_F6',
+  F7: 'VK_F7', F8: 'VK_F8', F9: 'VK_F9', F10: 'VK_F10', F11: 'VK_F11', F12: 'VK_F12',
+};
+const modifierVks = new Set(['VK_SHIFT', 'VK_CONTROL', 'VK_MENU']);
+
+function keyEvent(event, down) {
+  if (!wsState.connected || ui.view.checked) return;
+  if (event.repeat) return;
+  if (event.isComposing) return;
+  const name = vkNames[event.code];
+  if (!name) {
+    // A key we cannot name is a key we do not send. `text` covers the printable non-ASCII cases.
+    if (down && event.key && event.key.length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      send({ t: 'text', s: event.key });
+    }
+    return;
+  }
+  // A modifier's own transition carries the state, so it is sent with no modifier flags: passing
+  // `shift: true` alongside `VK_SHIFT` down would report the same key twice.
+  const flags = modifierVks.has(name)
+    ? {}
+    : { alt: event.altKey, ctrl: event.ctrlKey, shift: event.shiftKey, meta: event.metaKey };
+  if (name === 'VK_MENU') flags.alt = false;
+  const message = Object.assign({ t: 'key', code: name, down: down, press: false }, flags);
+  if (down) pressed.keys.add(name); else pressed.keys.delete(name);
+  send(message);
+  event.preventDefault();
+}
+
+ui.stage.addEventListener('keydown', (event) => keyEvent(event, true));
+ui.stage.addEventListener('keyup', (event) => keyEvent(event, false));
+
+function releaseAll() {
+  Array.from(pressed.keys).forEach((code) => send({ t: 'key', code: code, down: false, press: false }));
+  pressed.keys.clear();
+  Array.from(pressed.buttons).forEach((button) => {
+    const box = ui.screen.getBoundingClientRect();
+    send({
+      t: 'mouse', type: 'up', x: 0, y: 0, button: button,
+      alt: false, ctrl: false, shift: false, meta: false,
+    });
+    void box;
+  });
+  pressed.buttons.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Remote cursor
+// ---------------------------------------------------------------------------
+function updateCursorVisibility() {
+  const show = cursorState.wanted && !cursorState.embedded;
+  ui.cursor.style.display = show ? 'block' : 'none';
+  ui.stage.style.cursor = show ? 'none' : 'crosshair';
+}
+
+function paintCursor() {
+  if (!cursorState.wanted || cursorState.embedded) return;
+  const shape = cursorState.shapes.get(cursorState.id);
+  if (!shape) return;
+  const box = ui.screen.classList.contains('hidden') ? null : ui.screen.getBoundingClientRect();
+  const stageBox = ui.stage.getBoundingClientRect();
+  const geom = wsState.geom;
+  if (!box || !geom.w || !geom.h) return;
+  const scale = box.width / geom.w;
+  ui.cursor.src = shape.image.src;
+  ui.cursor.style.width = (shape.image.width * scale) + 'px';
+  ui.cursor.style.height = (shape.image.height * scale) + 'px';
+  ui.cursor.style.left = (box.left - stageBox.left + (cursorState.x - shape.hotx) * scale) + 'px';
+  ui.cursor.style.top = (box.top - stageBox.top + (cursorState.y - shape.hoty) * scale) + 'px';
+  ui.cursor.style.display = 'block';
+}
+
+window.addEventListener('resize', paintCursor);
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+ui.connect.onclick = () => {
+  const addr = ui.addr.value.trim();
+  if (!addr) { say('请先填写被控端地址。'); return; }
+  if (!wsState.socket || wsState.socket.readyState !== WebSocket.OPEN) {
+    say('网关尚未连上，正在重试。');
+    connectBridge();
+    return;
+  }
+  ui.connect.disabled = true;
+  ui.disconnect.disabled = false;
+  send({ t: 'open', addr: addr, password: ui.pass.value, view: ui.view.checked });
+  send({ t: 'remote-cursor', on: ui.remoteCursor.checked });
+};
+
+ui.disconnect.onclick = () => { send({ t: 'close' }); say('已请求断开当前会话。'); };
+ui.refresh.onclick = () => send({ t: 'refresh' });
+ui.disp.onchange = () => send({ t: 'display', i: parseInt(ui.disp.value, 10) || 0 });
+ui.quality.onchange = () => {
+  send({ t: 'quality', v: ui.quality.value });
+  if (ui.quality.value === 'custom') send({ t: 'custom-quality', v: parseInt(document.getElementById('cq').value, 10) || 80 });
+};
+document.getElementById('cq').onchange = (event) => send({ t: 'custom-quality', v: parseInt(event.target.value, 10) || 80 });
+document.getElementById('fpsIn').onchange = (event) => send({ t: 'fps', v: parseInt(event.target.value, 10) || 30 });
+ui.view.onchange = () => send({ t: 'view', on: ui.view.checked });
+ui.remoteCursor.onchange = () => {
+  cursorState.wanted = ui.remoteCursor.checked;
+  send({ t: 'remote-cursor', on: cursorState.wanted });
+  updateCursorVisibility();
+  paintCursor();
+};
+document.getElementById('ctrlaltdel').onclick = () => {
+  if (window.confirm('向被控端发送 Ctrl+Alt+Del？')) send({ t: 'ctrlaltdel' });
+};
+document.getElementById('lock').onclick = () => {
+  if (window.confirm('锁定被控端屏幕？解锁需要在对端完成。')) send({ t: 'lock' });
+};
+document.getElementById('release').onclick = () => { releaseAll(); say('已释放本地记录的按键与鼠标键。'); };
+document.getElementById('sendText').onclick = () => {
+  const field = document.getElementById('textIn');
+  if (!field.value) return;
+  send({ t: 'text', s: field.value });
+  say('已发送 ' + field.value.length + ' 个字符到远端。');
+  field.value = '';
+};
+document.getElementById('textIn').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') { event.preventDefault(); document.getElementById('sendText').click(); }
+});
+document.getElementById('clipPush').onclick = () => {
+  send({ t: 'clip-set', text: ui.clip.value });
+  say('已把 ' + ui.clip.value.length + ' 个字符发往远端剪贴板。');
+};
+document.getElementById('clipPull').onclick = () => send({ t: 'clip-get' });
+
+// Keep the cursor overlay honest: it is positioned from the image box, which only exists once a
+// frame is on screen.
+const cursorObserver = new MutationObserver(paintCursor);
+cursorObserver.observe(ui.screen, { attributes: true, attributeFilter: ['class', 'src'] });
+
+cursorState.id = '0';
+ui.cursor.addEventListener('load', () => paintCursor());
+
+connectBridge();
+say('正在连接本机网关…');
+</script>
+</body>
+</html>

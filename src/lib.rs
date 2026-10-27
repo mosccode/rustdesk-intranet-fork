@@ -26,6 +26,12 @@ mod direct_access;
 pub use self::direct_access::*;
 /// cbindgen:ignore
 pub mod common;
+// netguard webgate: the browser control console. It is a *control*-end surface - a `Session` with a
+// WebSocket for a UI - so it adds no inbound port to the controlled side and shares `mod server`'s
+// code path not at all. The contract the page is written against is the header of `webgate/mod.rs`.
+// Desktop-only because it JPEG-encodes through the `image` crate, which is a desktop dependency.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub mod webgate;
 #[cfg(not(any(target_os = "ios")))]
 pub mod ipc;
 #[cfg(not(any(

@@ -185,6 +185,15 @@ pub fn get_option<T: AsRef<str>>(key: T) -> String {
 
 #[inline]
 pub fn use_texture_render() -> bool {
+    // The webgate process has no GPU context and no window to blit into. Its `Session` must stay on
+    // the CPU path, because the texture path delivers frames to `on_texture` - a handle the JPEG
+    // encoder cannot read - and the browser would only ever see a black rectangle. This is a process
+    // property, not a user setting, so it is decided here rather than by writing `texture-render`
+    // into the shared config (which would quietly downgrade the native UI on the same machine).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    if crate::webgate::is_gateway_process() {
+        return false;
+    }
     #[cfg(target_os = "android")]
     return false;
     #[cfg(target_os = "ios")]
