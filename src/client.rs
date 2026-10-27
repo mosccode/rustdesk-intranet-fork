@@ -47,7 +47,9 @@ use hbb_common::{
     bail,
     config::{
         self, use_ws, Config, LocalConfig, PeerConfig, PeerInfoSerde, Resolution, CONNECT_TIMEOUT,
-        READ_TIMEOUT, RELAY_PORT, RENDEZVOUS_PORT,
+        // netguard 步 8: `RELAY_PORT` is no longer imported - its only use was the hardcoded
+        // `RELAY_PORT + 1` dial default below, which is now `netguard::direct_peer_port()`.
+        READ_TIMEOUT, RENDEZVOUS_PORT,
     },
     futures::future::{select_ok, BoxFuture, FutureExt},
     get_version_number, log,
@@ -436,8 +438,17 @@ impl Client {
         if hbb_common::is_ip_str(peer) {
             return Ok((
                 (
-                    connect_tcp_local(check_port(peer, RELAY_PORT + 1), None, CONNECT_TIMEOUT)
-                        .await?,
+                    // netguard 步 8: this used to be `RELAY_PORT + 1` = 21118 hardcoded, while the
+                    // listening half honoured the `direct-access-port` option - the asymmetry that
+                    // forced that option to be pinned. Both halves now call
+                    // `hbb_common::netguard::direct_peer_port()`, so an operator who cannot use
+                    // 21118 sets one option and both sides move. An explicit `ip:port` still wins.
+                    connect_tcp_local(
+                        check_port(peer, hbb_common::netguard::direct_peer_port()),
+                        None,
+                        CONNECT_TIMEOUT,
+                    )
+                    .await?,
                     true,
                     None,
                     None,

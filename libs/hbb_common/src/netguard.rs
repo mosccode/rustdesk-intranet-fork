@@ -580,27 +580,28 @@ pub const FORCED_OPTIONS: &[(&str, &str)] = &[
     // and would silently shadow the operator's allow-list). Keep it empty; netguard is the only
     // authority.
     ("whitelist", ""),
-    // No per-ID gate: the two subnets are the boundary, and an empty id list is what "any id from
-    // an allowed address" means. A stale non-empty value here would only break legitimate peers.
+    // No per-ID gate: the operator's allow-listed segments are the boundary, and an empty id list is
+    // what "any id from an allowed address" means. A stale non-empty value here would only break
+    // legitimate peers.
     ("id-whitelist", ""),
     // 需求 §一「双向直连」的正向开关。`option2bool` treats `direct-server` as `== "Y"` (空值 = 关,
-    // `config.rs:2842`), and it is the *only* thing that puts a listener on 21118
-    // (`src/rendezvous_mediator.rs::direct_server`) - the port the controller dials when the user
-    // types a peer's IP (`src/client.rs:439`, `RELAY_PORT + 1`). Left at its default the build would
-    // refuse every inbound direct connection, so the requirement would fail on its own happy path.
-    // Forced on, and not switchable from the UI or the config file (`is_forced_key`).
+    // `config.rs:2842`), and it is the *only* thing that puts a listener on the direct port
+    // (`src/direct_access.rs::direct_server`) - the port the controller dials when the user types a
+    // peer's IP (`src/client.rs`, `check_port(peer, netguard::direct_peer_port())`). Left at its
+    // default the build would refuse every inbound direct connection, so the requirement would fail
+    // on its own happy path. Forced on, and not switchable from the UI or the config file
+    // (`is_forced_key`).
     ("direct-server", "Y"),
     // Meaningless without a relay to fall back to (F1-F11); emptied so a leftover value cannot
     // look like a live knob in the file or the UI. Upstream read it as a hold-before-relay window -
     // see the note in `src/client.rs`'s `RELAY_FALLBACK_DELAY_MS`.
     ("relay-fallback-delay", ""),
-    // The inbound half of the direct pair. `src/rendezvous_mediator.rs::get_direct_port` (1.5.0:1310)
-    // turns this option into the listening port and falls back to `RENDEZVOUS_PORT + 2` = 21118 when it
-    // does not parse; the controller has no matching knob - `src/client.rs:439` dials
-    // `RELAY_PORT + 1` = 21118, hardcoded. So a non-empty value here only moves one side and silently
-    // breaks every inbound direct connection. Empty (= the default, both sides agree) is pinned; a
-    // deployment that really wants a different port needs 步 8's 人工确认, not a config edit.
-    ("direct-access-port", ""),
+    // 端口不再钉死（需求方要求「21118 不可用，端口要能自己指定」）。历史记录：上游把控制端写死成
+    // `RELAY_PORT + 1`（`src/client.rs`），而被控端 `src/direct_access.rs::get_direct_port` 读这个
+    // 选项，所以当年只有把它钉死为空（两侧都用默认值）才不会一侧重启、另一侧拨错端口。现在两侧都
+    // 走下面的 `direct_peer_port()` 这一个函数，一致性由结构保证；端口号也开不了外联 - 目的地仍然
+    // 只由 `intranet-allowlist.conf` 决定，改端口只是把 21118 这个数字换掉。写进文件的值由
+    // `startup_self_check` 校验，非法值直接拒绝启动而不是静默回落。
     // netguard L4 (需求 §二.1): the Telegram bot credential (`bot`, an encrypted JSON blob holding a
     // Bot API token and a chat id). The type that read and wrote it (`auth_2fa::TelegramBot`) is
     // deleted in 步 6-B, so nothing consumes a leftover value any more - but pinning it empty + listing
@@ -615,6 +616,35 @@ pub fn force_option(key: &str) -> Option<String> {
         .iter()
         .find(|(k, _)| *k == key)
         .map(|(_, v)| (*v).to_owned())
+}
+
+/// The one port the direct pair uses, in both directions.
+///
+/// Both halves of 需求 §一「双向直连」 call this and nothing else: the listener
+/// (`src/direct_access.rs::get_direct_port`) and the controller's dial default
+/// (`src/client.rs`, the `check_port(peer, …)` argument when the user typed a bare address). Upstream
+/// had the listener read an option and the controller hardcode `RELAY_PORT + 1`, which is why the
+/// option used to be pinned to the default - one knob could only move one side. With a single
+/// source the operator can set `direct-access-port` to whatever the deployment's firewall allows
+/// (需求方: 21118 不可用), and an empty / unset value keeps the historical 21118.
+///
+/// This is a *port* knob, not a *destination* knob: it cannot widen the guard, because every dial
+/// still has to pass `check_outbound_pair` against `intranet-allowlist.conf`.
+pub fn direct_peer_port() -> i32 {
+    peer_port_from_option(&Config::get_option("direct-access-port"))
+}
+
+/// The port a deployment gets when it never sets `direct-access-port` - upstream's direct port,
+/// which the docs and the settings-page hint name, and which `startup_self_check` keeps honest.
+pub const DEFAULT_DIRECT_PEER_PORT: i32 = 21118;
+
+/// The pure half of [`direct_peer_port`], so the fallback rule is testable without a config file.
+fn peer_port_from_option(raw: &str) -> i32 {
+    let fallback = crate::config::RENDEZVOUS_PORT + 2;
+    match raw.trim().parse::<i32>() {
+        Ok(port) if (1..=65535).contains(&port) => port,
+        _ => fallback,
+    }
 }
 
 /// Used by the `set_option` paths: a write to a forced key is dropped, not applied.
@@ -717,25 +747,36 @@ pub fn startup_self_check() -> Vec<String> {
         }
     }
     // 2. `direct-server` is the one *positive* pin. Without it nothing listens on the direct port
-    //    (`rendezvous_mediator.rs::direct_server` is gated by it), so the requirement's 「双向直连」
+    //    (`src/direct_access.rs::direct_server` is gated by it), so the requirement's 「双向直连」
     //    would fail on its happy path - a policy that lost the entry is broken by construction and must
     //    not start.
     if force_option("direct-server").as_deref() != Some("Y") {
         problems.push("direct-server is not pinned to \"Y\": no direct listener, inbound connections impossible".to_owned());
     }
-    // 3. the two halves of the direct port must stay equal: the controller dials `RELAY_PORT + 1`
-    //    (hardcoded), the listener uses `RENDEZVOUS_PORT + 2` unless `direct-access-port` says
-    //    otherwise - which is why that option is pinned to the empty (= default) value.
-    if force_option("direct-access-port").as_deref() != Some("") {
-        problems.push("direct-access-port must stay pinned to \"\" so the listener keeps the port the controller dials".to_owned());
-    }
-    // 3 continued: the arithmetic the two sides actually use. If upstream ever moves one constant, the
-    // pair stops matching and every inbound direct connection fails - catch it here, not on site.
-    if crate::config::RENDEZVOUS_PORT + 2 != crate::config::RELAY_PORT + 1 {
+    // 3. both halves of the direct port come from `direct_peer_port()`, so they cannot drift; what can
+    //    still go wrong is the operator's own value. A non-empty `direct-access-port` that does not
+    //    parse would silently fall back to 21118 on both sides - a working but *not the requested*
+    //    port, which is the kind of thing that must not be swallowed. Refuse to start and say why.
+    let stored_port = Config::get_option("direct-access-port");
+    if !stored_port.trim().is_empty() && peer_port_from_option(&stored_port).to_string() != stored_port.trim() {
         problems.push(format!(
-            "direct port mismatch: listener {} vs controller {}",
+            "direct-access-port = {:?} is not a port number 1-65535; it would fall back to {} instead of the port you asked for",
+            stored_port,
+            crate::config::RENDEZVOUS_PORT + 2
+        ));
+    }
+    // 3 continued: what an *unset* `direct-access-port` resolves to. The two halves can no longer drift
+    //    (both call `direct_peer_port()`), so the old check that upstream's listener default still
+    //    equalled its hardcoded controller default (`RELAY_PORT + 1`) is meaningless here - neither side
+    //    reads `RELAY_PORT` any more. What still matters is the number a fresh deployment listens on,
+    //    because that is what the docs, the settings page hint and the peer's firewall rule name. If the
+    //    fallback ever stops being 21118, that is a documented-behaviour change and must be caught here
+    //    rather than discovered on site.
+    if crate::config::RENDEZVOUS_PORT + 2 != DEFAULT_DIRECT_PEER_PORT {
+        problems.push(format!(
+            "the unset direct port is {} but the documented default is {}",
             crate::config::RENDEZVOUS_PORT + 2,
-            crate::config::RELAY_PORT + 1
+            DEFAULT_DIRECT_PEER_PORT
         ));
     }
     // 4. `custom-rendezvous-server` pinned to "" is what the *non-option* server stores are gated on:
@@ -1051,13 +1092,21 @@ mod tests {
             assert!(is_forced_key(k), "{} is purged but not pinned", k);
             assert!(is_policy_key(k));
         }
-        // Pinned without naming a server: the positive switch and the two port/window knobs. (These are
-        // deliberately not in `SERVER_SHAPED_KEYS`: `direct-server` = "Y" is what the build *wants*
-        // stored nowhere, but the pin itself is the guarantee, so the purge dropping it is fine.)
-        for k in ["direct-server", "relay-fallback-delay", "direct-access-port", "id-whitelist"] {
+        // Pinned without naming a server: the positive switch, the relay window, and the upstream
+        // peer-ID gate that must stay empty so netguard's allow-list is the only inbound authority.
+        // (These are deliberately not in `SERVER_SHAPED_KEYS`: `direct-server` = "Y" is what the build
+        // *wants* stored nowhere, but the pin itself is the guarantee, so the purge dropping it is
+        // fine.)
+        for k in ["direct-server", "relay-fallback-delay", "id-whitelist"] {
             assert!(is_forced_key(k), "{}", k);
             assert!(is_policy_key(k), "{}", k);
         }
+        // `direct-access-port` is the opposite case: deliberately *not* pinned, so the operator can
+        // move the direct pair off 21118 when that port is not usable on their network. Both halves
+        // read `direct_peer_port()`, which is what makes the old pin unnecessary (see the invariant in
+        // `startup_self_check`).
+        assert!(!is_forced_key("direct-access-port"));
+        assert!(!is_policy_key("direct-access-port"));
         assert_eq!(force_option("direct-server").as_deref(), Some("Y"));
         assert_eq!(force_option("relay-server").as_deref(), Some(""));
         // 步 6-B: the Telegram bot credential is a public-service secret with no reader left.
@@ -1073,6 +1122,30 @@ mod tests {
         // Nothing else is pinned - `lang` is the stand-in for an ordinary option.
         assert_eq!(force_option("lang"), None);
         assert!(!is_policy_key("lang"));
+    }
+
+    #[test]
+    fn operator_can_move_the_direct_pair_off_21118() {
+        // The whole point of un-pinning `direct-access-port`: one value, both sides, no silent
+        // half-migration. Anything unusable falls back to the historical default, and
+        // `startup_self_check` refuses to start on a value that would fall back unexpectedly.
+        let default_port = crate::config::RENDEZVOUS_PORT + 2;
+        assert_eq!(default_port, DEFAULT_DIRECT_PEER_PORT);
+        assert_eq!(DEFAULT_DIRECT_PEER_PORT, 21118);
+        for unusable in ["", " ", "0", "-1", "65536", "abc", "21118abc"] {
+            assert_eq!(
+                peer_port_from_option(unusable),
+                default_port,
+                "{:?} must fall back",
+                unusable
+            );
+        }
+        assert_eq!(peer_port_from_option("9001"), 9001);
+        assert_eq!(peer_port_from_option(" 9001 "), 9001);
+        assert_eq!(peer_port_from_option("1"), 1);
+        assert_eq!(peer_port_from_option("65535"), 65535);
+        // A write to it is no longer a policy violation.
+        assert_eq!(refuse_pinned_write("direct-access-port", "9001", "test"), None);
     }
 
     #[test]

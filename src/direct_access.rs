@@ -8,7 +8,8 @@
 //   * relay (`handle_request_relay`, `create_relay`) - removed in 步 4 (F1-F11);
 //   * punching (`handle_punch_hole`, `punch_udp_hole`, `punch_tcp_until_connected`, `punch_until`,
 //     `serve_punched`, `accept_punched_connection`) and its IPv6 half (`start_ipv6`,
-//     `udp_nat_listen`) - the controller dials port 21118 directly, so no hole needs punching;
+//     `udp_nat_listen`) - the controller dials this machine's direct port (`get_direct_port` below,
+//     i.e. `netguard::direct_peer_port()`), so no hole needs punching;
 //   * LAN discovery - removed in 步 6-D.
 //
 // What is left is the one inbound listener this build has: `direct_server`, plus `start_all` (its
@@ -18,7 +19,7 @@
 
 use hbb_common::{
     allow_err,
-    config::{self, option2bool, Config, RENDEZVOUS_PORT},
+    config::{self, option2bool, Config},
     log, sleep, tokio, Stream,
 };
 
@@ -69,13 +70,11 @@ pub async fn start_all() {
 }
 
 fn get_direct_port() -> i32 {
-    let mut port = Config::get_option("direct-access-port")
-        .parse::<i32>()
-        .unwrap_or(0);
-    if port <= 0 {
-        port = RENDEZVOUS_PORT + 2;
-    }
-    port
+    // netguard 步 8: the listener and the controller's dial default read the same helper, so an
+    // operator-set port moves both sides at once. Upstream had the controller hardcode
+    // `RELAY_PORT + 1` here while this half honoured the option, which is why the option used to be
+    // pinned to empty; see `hbb_common::netguard::direct_peer_port`.
+    hbb_common::netguard::direct_peer_port()
 }
 
 async fn direct_server(server: ServerPtr) {
