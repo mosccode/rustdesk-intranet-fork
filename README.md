@@ -32,6 +32,10 @@ it was forked from.
 Prebuilt Windows x64 binaries are attached to releases in this repository. Each release notes the
 source commit it was built from.
 
+- `rustdesk-intranet-portable.exe` - a single-file portable build. It unpacks its payload to a
+  per-user directory on first run and starts the same application; no installer is required.
+- `rustdesk-intranet-windows-x64.zip` - the full `Release/` directory, plus the license files.
+
 Build from source (same steps as CI):
 
 ```bash
