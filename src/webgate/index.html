@@ -150,7 +150,7 @@
        确定 button runs, and a dialog-form submit closes the dialog without reaching either handler. -->
   <form id="promptForm">
     <p id="promptTitle" style="margin:0;font-weight:600"></p>
-    <p id="promptText" style="margin:0;color:var(--dim)"></p>
+    <p id="promptText" style="margin:0;color:var(--dim);white-space:pre-line"></p>
     <input id="promptInput" type="password" placeholder="密码" autocomplete="off" spellcheck="false" class="hidden">
     <menu>
       <button id="promptNo" type="button" class="plain">取消</button>
@@ -336,6 +336,14 @@ function handleEvent(message) {
       else if (message.s === 'busy') { setState('网关被占用', 'bad'); say(message.msg || '另一个标签页正在使用本网关。'); }
       else if (message.s === 'auth-ok') setState('已验证，待连接', 'busy');
       if (message.msg) say(message.msg);
+      // A round that is over has to leave 「连接」 clickable, or the only way back is reloading the
+      // page: `auth-ok` is what the gateway says when it refused the address before even dialing, and
+      // `disconnected` is what it says once a dialled round has ended. `closing` deliberately is not
+      // in this list - the gateway follows it with `disconnected` when the session really is gone.
+      if (message.s === 'disconnected' || message.s === 'auth-ok') {
+        ui.connect.disabled = false;
+        ui.disconnect.disabled = true;
+      }
       return;
     case 'geom':
       wsState.geom = { w: message.w || 0, h: message.h || 0 };
@@ -467,6 +475,20 @@ function askMessage(message) {
   }
   if (type === 'restarting' || type === 'wait-remote-accept-nook') {
     say((message.title || '提示') + '：' + (message.text || ''));
+    return;
+  }
+  if (type === 'error' && message.title === 'Connection Error') {
+    // Upstream composes this message in English (`client.rs::on_establish_connection_error`), and the
+    // detail line stays verbatim: it names the address and the OS error, which is exactly what has to
+    // be readable when someone reports a failure. What upstream cannot say is the one thing this build
+    // guarantees - a failed direct connection is the end of the story - so that is said here.
+    showPrompt(
+      '连不上这台机器',
+      (message.text || '未知错误') +
+        '\n\n本构建没有中继：直连失败就是失败，不会改走别的通道。请核对地址与端口、对端是否在运行，以及它是否落在允许的私有网段里（一旦写过 intranet-allowlist.conf，名单外的地址就连不上）。',
+      {},
+      () => {},
+    );
     return;
   }
   showPrompt(message.title || '提示', message.text || '', { withCancel: type === 'question' || type.indexOf('insecure') >= 0 }, (yes) => {

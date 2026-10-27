@@ -421,6 +421,15 @@ impl InvokeUiSession for WebUi {
                 self.event(json!({
                     "t": "msgbox", "type": other, "title": title, "text": text, "retry": retry,
                 }));
+                // Upstream ends a *failed* round by calling `on_establish_connection_error`, which is
+                // this msgbox ("Connection Error", see `client.rs`); `close_success()` only fires when
+                // the peer closes a session that had come up. So without the line below the page never
+                // learns the attempt is over, and the operator stays on 「连接中」 with 「连接」
+                // disabled - measured in a real browser on 2026-10-28 against a port with nothing
+                // listening. Only this title: a mid-session "Login Error" must not look like a drop.
+                if title == "Connection Error" {
+                    self.emit_state("disconnected", "");
+                }
             }
         }
     }
@@ -659,8 +668,15 @@ fn dispatch(ui: &WebUi, session: Option<&Arc<Session<WebUi>>>, value: &Value) {
             ui.with_session(|s| s.send_selected_session_id(sid));
         }
         "close" => {
-            ui.emit_state("closing", "");
-            ui.close_session();
+            if ui.session().is_none() {
+                // `closing` is a wait-for-`close_success` state, and with no session that reply never
+                // arrives: the page would sit on 「正在关闭」 with 「连接」 greyed out until a reload.
+                // Measured in a real browser on 2026-10-28 after the gateway had refused the address.
+                ui.emit_state("auth-ok", "当前没有进行中的会话。");
+            } else {
+                ui.emit_state("closing", "");
+                ui.close_session();
+            }
         }
         "ping" => ui.event(json!({"t": "pong"})),
         other => ui.note(&format!("网关不认识指令 {:?}。", other)),
@@ -673,7 +689,10 @@ fn open_session(ui: &WebUi, value: &Value) {
     let password = str_field(value, "password");
     let view = bool_field(value, "view");
     if addr.is_empty() {
-        ui.note("地址为空。请填写被控端的字面 IP，可带端口（例如 10.0.12.34:9001）。");
+        ui.emit_state(
+            "auth-ok",
+            "地址为空。请填写被控端的字面 IP，可带端口（例如 10.0.12.34:9001）。",
+        );
         return;
     }
     // Literal IP only, same rule as the desktop client: the resolver is not in this build, so a
@@ -685,10 +704,13 @@ fn open_session(ui: &WebUi, value: &Value) {
             "webgate::peer::open",
             "reason=not_literal_ip note=the page may only name a literal address",
         );
-        ui.note(&format!(
-            "{:?} 不是字面 IP。本构建不做域名解析，请填写 IPv4，或带端口的 [IPv6]:端口。",
-            addr
-        ));
+        ui.emit_state(
+            "auth-ok",
+            &format!(
+                "{:?} 不是字面 IP。本构建不做域名解析，请填写 IPv4，或带端口的 [IPv6]:端口。",
+                addr
+            ),
+        );
         return;
     }
     if let Some(session) = ui.session() {
