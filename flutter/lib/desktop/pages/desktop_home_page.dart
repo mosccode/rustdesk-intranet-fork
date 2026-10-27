@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:convert';
 
 import 'package:auto_size_text/auto_size_text.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
@@ -48,10 +49,15 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsInputMonitoring = false;
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
+  Timer? _intranetAddrTimer;
   bool isCardClosed = false;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
+
+  /// Local IPv4 addresses this build is allowed to serve on. Detected from the
+  /// OS interface list; no network traffic is generated.
+  List<String> _intranetAddrs = [];
 
   final GlobalKey _childKey = GlobalKey();
 
@@ -90,7 +96,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         child: loadLogo(),
       ),
       buildTip(context),
-      if (!isOutgoingOnly) buildIDBoard(context),
+      if (!isOutgoingOnly) buildIntranetBoard(context),
       if (!isOutgoingOnly) buildPasswordBoard(context),
       FutureBuilder<Widget>(
         future: Future.value(
@@ -185,19 +191,66 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
-  buildIDBoard(BuildContext context) {
-    final model = gFFI.serverModel;
+  int get _directPort {
+    final v = int.tryParse(
+            bind.mainGetOptionSync(key: 'direct-access-port')) ??
+        0;
+    return v > 0 ? v : 21118;
+  }
+
+  /// Mirrors the runtime allowlist's private-space rule so the board never
+  /// advertises an address this build would refuse to serve.
+  static bool _isIntranetIpv4(String ip) {
+    final parts = ip.split('.');
+    if (parts.length != 4) return false;
+    final nums = <int>[];
+    for (final p in parts) {
+      final n = int.tryParse(p);
+      if (n == null || n < 0 || n > 255) return false;
+      nums.add(n);
+    }
+    final a = nums[0], b = nums[1];
+    return a == 10 ||
+        (a == 172 && b >= 16 && b <= 31) ||
+        (a == 192 && b == 168) ||
+        (a == 100 && b >= 64 && b <= 127) ||
+        (a == 169 && b == 254);
+  }
+
+  Future<void> _refreshIntranetAddrs() async {
+    final addrs = <String>[];
+    try {
+      final interfaces = await NetworkInterface.list(
+          type: InternetAddressType.IPv4, includeLoopback: false);
+      for (final itf in interfaces) {
+        for (final addr in itf.addresses) {
+          if (_isIntranetIpv4(addr.address) && !addrs.contains(addr.address)) {
+            addrs.add(addr.address);
+          }
+        }
+      }
+    } catch (_) {}
+    addrs.sort();
+    if (mounted && !listEquals(addrs, _intranetAddrs)) {
+      setState(() => _intranetAddrs = addrs);
+    }
+  }
+
+  buildIntranetBoard(BuildContext context) {
+    final textColor = Theme.of(context).textTheme.titleLarge?.color;
+    final port = _directPort;
+    final entries = _intranetAddrs.map((ip) => '$ip:$port').toList();
+    final hasAddr = entries.isNotEmpty;
+    final shown = hasAddr ? entries.join('  /  ') : translate("intranet_no_address");
     return Container(
-      margin: const EdgeInsets.only(left: 20, right: 11),
-      height: 57,
+      margin: const EdgeInsets.only(left: 20, right: 11, top: 10, bottom: 6),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.baseline,
-        textBaseline: TextBaseline.alphabetic,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Container(
             width: 2,
             decoration: const BoxDecoration(color: MyTheme.accent),
-          ).marginOnly(top: 5),
+          ),
           Expanded(
             child: Padding(
               padding: const EdgeInsets.only(left: 7),
@@ -211,39 +264,39 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
                         Text(
-                          translate("ID"),
+                          translate("intranet_direct_address"),
                           style: TextStyle(
                               fontSize: 14,
-                              color: Theme.of(context)
-                                  .textTheme
-                                  .titleLarge
-                                  ?.color
-                                  ?.withOpacity(0.5)),
+                              color: textColor?.withOpacity(0.5)),
                         ).marginOnly(top: 5),
                         buildPopupMenu(context)
                       ],
                     ),
                   ),
-                  Flexible(
-                    child: GestureDetector(
-                      onDoubleTap: () {
-                        Clipboard.setData(
-                            ClipboardData(text: model.serverId.text));
-                        showToast(translate("Copied"));
-                      },
-                      child: TextFormField(
-                        controller: model.serverId,
-                        readOnly: true,
-                        decoration: InputDecoration(
-                          border: InputBorder.none,
-                          contentPadding: EdgeInsets.only(top: 10, bottom: 10),
-                        ),
+                  GestureDetector(
+                    onDoubleTap: hasAddr
+                        ? () {
+                            Clipboard.setData(
+                                ClipboardData(text: entries.first));
+                            showToast(translate("Copied"));
+                          }
+                        : null,
+                    child: Tooltip(
+                      message: hasAddr
+                          ? translate("intranet_copy_address_tip")
+                          : translate("intranet_no_address_tip"),
+                      child: AutoSizeText(
+                        shown,
+                        maxLines: 2,
+                        minFontSize: 11,
                         style: TextStyle(
-                          fontSize: 22,
+                          fontSize: hasAddr ? 18 : 13,
+                          height: 1.3,
+                          color: hasAddr ? null : textColor?.withOpacity(0.6),
                         ),
-                      ).workaroundFreezeLinuxMint(),
+                      ),
                     ),
-                  )
+                  ),
                 ],
               ),
             ),
@@ -401,7 +454,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 Align(
                   alignment: Alignment.centerLeft,
                   child: Text(
-                    translate("Your Desktop"),
+                    translate("intranet_local_desktop"),
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                 ),
@@ -692,6 +745,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   @override
   void initState() {
     super.initState();
+    _refreshIntranetAddrs();
+    _intranetAddrTimer = Timer.periodic(const Duration(seconds: 10),
+        (_) => _refreshIntranetAddrs());
     _updateTimer = periodic_immediate(const Duration(seconds: 1), () async {
       await gFFI.serverModel.fetchID();
       final error = await bind.mainGetError();
@@ -867,6 +923,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     _uniLinksSubscription?.cancel();
     Get.delete<RxBool>(tag: 'stop-service');
     _updateTimer?.cancel();
+    _intranetAddrTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }

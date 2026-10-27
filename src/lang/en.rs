@@ -1,7 +1,14 @@
 lazy_static::lazy_static! {
 pub static ref T: std::collections::HashMap<&'static str, &'static str> =
     [
-        ("desk_tip", "Your desktop can be accessed with this ID and password."),
+        ("desk_tip", "This machine never connects to a RustDesk server. Peers connect directly to the address above using the password below."),
+        ("intranet_local_desktop", "This Device · Intranet Only"),
+        ("intranet_direct_address", "Intranet address"),
+        ("intranet_no_address", "No intranet IPv4 address detected"),
+        ("intranet_no_address_tip", "Check that a private IPv4 address is configured on this machine"),
+        ("intranet_copy_address_tip", "Double-click to copy; peers enter it in the connect box"),
+        ("intranet_status", "Intranet only · no server · direct IP only"),
+        ("intranet_enter_remote_addr", "Enter peer intranet IP (e.g. 192.168.1.20:21118)"),
         ("connecting_status", "Connecting to the RustDesk network..."),
         ("not_ready_status", "Not ready. Please check your connection"),
         ("ID/Relay Server", "ID/Relay server"),

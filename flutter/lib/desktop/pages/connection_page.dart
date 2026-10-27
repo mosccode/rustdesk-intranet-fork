@@ -10,7 +10,6 @@ import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:get/get.dart';
-import 'package:url_launcher/url_launcher_string.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
 
@@ -113,11 +112,9 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(4),
                 color: _svcStopped.value ||
-                        stateGlobal.svcStatus.value == SvcStatus.connecting
+                        stateGlobal.svcStatus.value == SvcStatus.notReady
                     ? kColorWarn
-                    : (stateGlobal.svcStatus.value == SvcStatus.ready
-                        ? Color.fromARGB(255, 50, 190, 166)
-                        : Color.fromARGB(255, 224, 79, 95)),
+                    : Color.fromARGB(255, 50, 190, 166),
               ),
             ).marginSymmetric(horizontal: em),
             Container(
@@ -153,11 +150,7 @@ class _OnlineStatusWidgetState extends State<OnlineStatusWidget> {
     return Text(
       _svcStopped.value
           ? translate("Service is not running")
-          : stateGlobal.svcStatus.value == SvcStatus.connecting
-              ? translate("connecting_status")
-              : stateGlobal.svcStatus.value == SvcStatus.notReady
-                  ? translate("not_ready_status")
-                  : translate('Ready'),
+          : translate("intranet_status"),
       style: TextStyle(fontSize: em),
     );
   }
@@ -427,7 +420,7 @@ class _ConnectionPageState extends State<ConnectionPage>
                               counterText: '',
                               hintText: _idInputFocused.value
                                   ? null
-                                  : translate('Enter Remote ID'),
+                                  : translate('intranet_enter_remote_addr'),
                               contentPadding: const EdgeInsets.symmetric(
                                   horizontal: 15, vertical: 13)),
                           controller: fieldTextEditingController,
