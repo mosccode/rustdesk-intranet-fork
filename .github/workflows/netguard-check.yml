@@ -177,9 +177,11 @@ jobs:
           python -m pip install --disable-pip-version-check -q -r libs/portable/requirements.txt
           cd libs/portable
           python generate.py -f ../../flutter/build/windows/x64/runner/Release -o . -e ../../flutter/build/windows/x64/runner/Release/rustdesk.exe
-          cargo build --release --locked
-          cp target/release/rustdesk-portable-packer.exe ../../rustdesk-intranet-portable.exe
-          ls -l ../../rustdesk-intranet-portable.exe
+          cd ../..
+          # libs/portable is a workspace member: the binary lands in the workspace target dir.
+          cargo build -p rustdesk-portable-packer --release --locked
+          cp target/release/rustdesk-portable-packer.exe rustdesk-intranet-portable.exe
+          ls -l rustdesk-intranet-portable.exe
       - name: Locate artifacts
         shell: bash
         run: |
