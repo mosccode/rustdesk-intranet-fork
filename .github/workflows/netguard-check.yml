@@ -180,8 +180,8 @@ jobs:
           cd ../..
           # libs/portable is a workspace member: the binary lands in the workspace target dir.
           cargo build -p rustdesk-portable-packer --release --locked
-          cp target/release/rustdesk-portable-packer.exe rustdesk-intranet-portable.exe
-          ls -l rustdesk-intranet-portable.exe
+          cp target/release/rustdesk-portable-packer.exe rustdesk-intranet-1.5.0-x86_64.exe
+          ls -l rustdesk-intranet-1.5.0-x86_64.exe
       - name: Locate artifacts
         shell: bash
         run: |
@@ -196,7 +196,7 @@ jobs:
           path: |
             target/release/librustdesk.dll
             flutter/build/windows/x64/runner/Release
-            rustdesk-intranet-portable.exe
+            rustdesk-intranet-1.5.0-x86_64.exe
           retention-days: 7
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/')
@@ -206,7 +206,7 @@ jobs:
           cp -r flutter/build/windows/x64/runner/Release dist/rustdesk-intranet/
           cp target/release/librustdesk.dll dist/rustdesk-intranet/Release/
           cp LICENCE NOTICE MODIFICATIONS.md README.md dist/rustdesk-intranet/
-          cp rustdesk-intranet-portable.exe dist/
+          cp rustdesk-intranet-1.5.0-x86_64.exe dist/
           cd dist && 7z a -tzip rustdesk-intranet-windows-x64.zip rustdesk-intranet
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
@@ -214,4 +214,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}"             dist/rustdesk-intranet-windows-x64.zip             dist/rustdesk-intranet-portable.exe             --title "${{ github.ref_name }}"             --notes "Windows x64 builds from source at ${{ github.sha }}. rustdesk-intranet-portable.exe is a single-file portable build; the zip is the full directory. Configure your intranet ranges in intranet-allowlist.conf; see README."
+          gh release create "${{ github.ref_name }}"             dist/rustdesk-intranet-windows-x64.zip             dist/rustdesk-intranet-1.5.0-x86_64.exe             --title "${{ github.ref_name }}"             --notes "Windows x64 builds from source at ${{ github.sha }}. rustdesk-intranet-1.5.0-x86_64.exe is a single-file portable build; the zip is the full directory. Configure your intranet ranges in intranet-allowlist.conf; see README."
