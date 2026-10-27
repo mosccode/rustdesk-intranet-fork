@@ -226,12 +226,14 @@ fn refuse(reason: &str) {
 
 /// `<config_dir>/webgate-status.txt`：一行说清现在听在哪、口令校验开没开。写完就丢，不是日志。
 fn write_status(bind: std::net::SocketAddr, turned_off: bool) {
-    // A wildcard bind has no URL worth typing: `http://0.0.0.0/` is not it, and loopback is refused
-    // by the Host check on purpose (a gateway is meant to be opened through the address the network
-    // can actually reach). So the wildcard case names the rule instead of a fake address.
+    // A wildcard bind has no URL worth typing: `http://0.0.0.0/` is not it. The Host check compares
+    // against the address the socket actually landed on, so any address that reaches this port works
+    // - the machine's own LAN address, and also loopback, since `127.0.0.1` is the guard's standing
+    // local-IPC exception. So the wildcard case names the rule plus the two things an operator types.
     let page = if bind.ip().is_unspecified() {
         format!(
-            "浏览器打开 http://<这台机器的内网 IP>:{}/（不要用 127.0.0.1，本机回环会被拒绝）",
+            "浏览器打开 http://<这台机器的内网 IP>:{}/（就在这台机器上时直接 http://127.0.0.1:{}/）",
+            bind.port(),
             bind.port()
         )
     } else {
