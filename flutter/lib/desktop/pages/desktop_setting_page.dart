@@ -482,8 +482,6 @@ class _GeneralState extends State<_General> {
   Widget other() {
     final incomingOnly = bind.isIncomingOnly();
     final outgoingOnly = bind.isOutgoingOnly();
-    final showAutoUpdate = (isWindows && bind.mainIsInstalled()) ||
-    (isMacOS && bind.mainIsInstalled() && bind.mainIsInstalledDaemon(prompt: false) && !bind.isCustomClient());
     final children = <Widget>[
       if (!isWeb && !incomingOnly)
         _OptionCheckBox(context, 'Confirm before closing multiple tabs',
@@ -551,20 +549,12 @@ class _GeneralState extends State<_General> {
             ),
           ),
       ],
-      if (!isWeb && !bind.isCustomClient())
-        _OptionCheckBox(
-          context,
-          'Check for software update on startup',
-          kOptionEnableCheckUpdate,
-          isServer: false,
-        ),
-      if (showAutoUpdate)
-        _OptionCheckBox(
-          context,
-          'Auto update',
-          kOptionAllowAutoUpdate,
-          isServer: true,
-        ),
+      // netguard L2 (步 6-C): the two update switches upstream shows here - "Check for software
+      // update on startup" and "Auto update" - are gone. The update module itself is deleted
+      // (`src/updater.rs`) and `main_get_software_update_url()` is a stub that contacts nothing, so
+      // a switch would have governed nothing; leaving it would mean a control whose value the build
+      // ignores. The two options stay pinned to `N` in `FORCED_OPTIONS` so a leftover value in
+      // `RustDesk2.toml` cannot look like a live knob either.
       if (isWindows && !outgoingOnly)
         _OptionCheckBox(
           context,
@@ -1384,6 +1374,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       _OptionCheckBox(context, 'Deny LAN discovery', 'enable-lan-discovery',
           reverse: true, enabled: enabled),
       ...directIp(context),
+      whitelist(),
+      idWhitelist(),
       intranetAllowlist(),
       ...autoDisconnect(context),
       _OptionCheckBox(context, 'keep-awake-during-incoming-sessions-label',
@@ -1490,18 +1482,129 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     ];
   }
 
+  // The two upstream inbound gates, restored verbatim.
+  //
+  // An earlier revision of this fork pinned `whitelist` / `id-whitelist` empty and deleted these
+  // cards, which was scope creep: both are checked against traffic that has already been accepted by
+  // the netguard allow-list (`src/server/connection.rs:1410` for the peer address, `:1439` for the id
+  // the controller declares), so they restrict who may reach *this* machine and have nothing to do
+  // with reaching the internet. Un-pinning them is what makes the checkboxes live again - with the
+  // pin in place the card looked usable while every value came back empty.
+  //
+  // Read the two tooltips for their strength, because they are not the same kind of gate: the IP
+  // list is bound to the accepted socket and cannot be forged by the other side, while an id is
+  // self-reported and unsigned - it keeps out a mistyped address, not an attacker.
+  Widget whitelist() {
+    bool enabled = !locked;
+    // Simple temp wrapper for PR check
+    tmpWrapper() {
+      RxBool hasWhitelist = whitelistNotEmpty().obs;
+      update() async {
+        hasWhitelist.value = whitelistNotEmpty();
+      }
+
+      onChanged(bool? checked) async {
+        changeWhiteList(callback: update);
+      }
+
+      final isOptFixed = isOptionFixed(kOptionWhitelist);
+      return GestureDetector(
+        child: Tooltip(
+          message: translate('whitelist_tip'),
+          child: Obx(() => Row(
+                children: [
+                  Checkbox(
+                          value: hasWhitelist.value,
+                          onChanged: enabled && !isOptFixed ? onChanged : null)
+                      .marginOnly(right: 5),
+                  Offstage(
+                    offstage: !hasWhitelist.value,
+                    child: MouseRegion(
+                      child: const Icon(Icons.warning_amber_rounded,
+                              color: Color.fromARGB(255, 255, 204, 0))
+                          .marginOnly(right: 5),
+                      cursor: SystemMouseCursors.click,
+                    ),
+                  ),
+                  Expanded(
+                      child: Text(
+                    translate('Use IP Whitelisting'),
+                    style:
+                        TextStyle(color: disabledTextColor(context, enabled)),
+                  ))
+                ],
+              )),
+        ),
+        onTap: enabled
+            ? () {
+                onChanged(!hasWhitelist.value);
+              }
+            : null,
+      ).marginOnly(left: _kCheckBoxLeftMargin);
+    }
+
+    return tmpWrapper();
+  }
+
+  Widget idWhitelist() {
+    bool enabled = !locked;
+    RxBool hasIdWhitelist = idWhitelistNotEmpty().obs;
+    update() async {
+      hasIdWhitelist.value = idWhitelistNotEmpty();
+    }
+
+    onChanged(bool? checked) async {
+      changeIdWhiteList(callback: update);
+    }
+
+    final isOptFixed = isOptionFixed(kOptionIdWhitelist);
+    return GestureDetector(
+      child: Tooltip(
+        message: translate('id_whitelist_tip'),
+        child: Obx(() => Row(
+              children: [
+                Checkbox(
+                        value: hasIdWhitelist.value,
+                        onChanged: enabled && !isOptFixed ? onChanged : null)
+                    .marginOnly(right: 5),
+                Offstage(
+                  offstage: !hasIdWhitelist.value,
+                  child: MouseRegion(
+                    child: const Icon(Icons.warning_amber_rounded,
+                            color: Color.fromARGB(255, 255, 204, 0))
+                        .marginOnly(right: 5),
+                    cursor: SystemMouseCursors.click,
+                  ),
+                ),
+                Expanded(
+                    child: Text(
+                  translate('Use ID whitelisting'),
+                  style: TextStyle(color: disabledTextColor(context, enabled)),
+                ))
+              ],
+            )),
+      ),
+      onTap: enabled
+          ? () {
+              onChanged(!hasIdWhitelist.value);
+            }
+          : null,
+    ).marginOnly(left: _kCheckBoxLeftMargin);
+  }
+
   // Fork (netguard 阶段 5): the intranet allow-list, editable from inside the app.
   //
-  // This replaces the upstream `whitelist()` card. That one is not merely unused here, it is
-  // misleading: `whitelist` is pinned empty by netguard's `FORCED_OPTIONS`, so every value
-  // `changeWhiteList` wrote came back as "" on the next read while the checkbox still looked
-  // usable - the operator walks away believing a list exists. The guard's real list is a file, and
-  // this card is the editor for it.
+  // This is a third, separate list: the guard's own file (`intranet-allowlist.conf`), which decides
+  // which addresses this build will talk to or accept at all. The two upstream cards above sit
+  // *behind* it - an address outside this list never reaches them - and emptying this one changes
+  // nothing about them: with no entry the guard allows all private IPv4 space.
   Widget intranetAllowlist() {
     bool enabled = !locked;
     RxInt loaded = bind.mainIntranetAllowlistCount().obs;
+    RxBool narrowed = bind.mainIntranetAllowlistNarrowed().obs;
     update() {
       loaded.value = bind.mainIntranetAllowlistCount();
+      narrowed.value = bind.mainIntranetAllowlistNarrowed();
     }
 
     return Obx(() => Column(
@@ -1533,16 +1636,17 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
               style: const TextStyle(fontSize: 12),
             ).marginOnly(top: 2),
             Text(
-              translate(loaded.value == 0
-                  ? 'intranet_allowlist_empty_tip'
-                  : 'intranet_allowlist_tip'),
-              style: TextStyle(
-                fontSize: 12,
-                color: loaded.value == 0
-                    ? const Color.fromARGB(255, 255, 170, 0)
-                    : null,
-              ),
+              // Two states, because the number alone lies: a fresh install loads the five private
+              // ranges and a narrowed deployment can easily list five ranges too.
+              translate(narrowed.value
+                  ? 'intranet_allowlist_narrowed'
+                  : 'intranet_allowlist_all_private'),
+              style: const TextStyle(fontSize: 12),
             ).marginOnly(top: 4),
+            Text(
+              translate('intranet_allowlist_tip'),
+              style: const TextStyle(fontSize: 12),
+            ).marginOnly(top: 2),
           ],
         )).marginOnly(
             left: _kCheckBoxLeftMargin,

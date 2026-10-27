@@ -6,12 +6,18 @@
 //! remote peer while the persisted config has no integrity protection. So the decision is taken
 //! here, at connect/send time, never from the UI or from a remote message.
 //!
-//! The allow-list is the one operator-supplied input: `intranet-allowlist.conf` next to the app
-//! config, re-read at startup. It can only contain private IPv4 space; public entries are refused
-//! and audited, so configuring a deployment cannot re-open the internet.
+//! The policy is "private space in, everything else out", and it needs no configuration: with no
+//! allow-list file an unconfigured machine still reaches its own LAN, because the reachable set
+//! defaults to [`DEFAULT_PRIVATE_RANGES`]. `intranet-allowlist.conf` is only a *narrowing* tool -
+//! a deployment that wants "just these two /24" writes those ranges and every other private range
+//! stops working too. It can never widen the guard: an entry outside private space (a public
+//! address, a hostname, a domain name) is refused and audited, so editing the file cannot turn this
+//! build back into an internet client.
 //!
 //! Security properties:
-//! - default-deny: unlisted addresses are refused, in both directions, with an audit line
+//! - default-deny *beyond private space*: public addresses, host names, relays and updates are
+//!   refused, in both directions, with an audit line; anything the guard allows is a literal IPv4
+//!   range inside RFC1918/CGNAT/link-local space
 //! - one guard for every socket, deny + audit, no retry, no fallback path
 //! - server-shaped options are pinned to safe values in `FORCED_OPTIONS` and cannot be widened
 //!   by the config file, the UI or a remote peer
@@ -33,22 +39,28 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::ResultType;
 
-/// The user's intranet allow-list, read at startup from this file under the app config directory
+/// The operator's intranet allow-list, read at startup from this file under the app config directory
 /// (e.g. `%APPDATA%\RustDesk\config\intranet-allowlist.conf` on Windows).
 ///
-/// The list is supplied by the operator, not compiled in: deployments differ, and a fork that
-/// hardcodes one site's subnet is both unusable elsewhere and leaks that site's layout. The file
-/// may only widen the guard inside private IPv4 space (RFC1918, `100.64/10`, `169.254/16`) -
-/// a public entry is refused and audited, so "configure your own range" can never turn this build
-/// back into an internet client.
+/// It is optional. With no file, or a file that names no entry, the guard allows every private IPv4
+/// range in [`DEFAULT_PRIVATE_RANGES`] and nothing else - the requirement is 掐掉公网, so an
+/// unconfigured machine must still reach its own LAN. Listing ranges **narrows** that set, which is
+/// what a deployment that wants "only these two /24" writes here. The file can never widen the
+/// guard past private space: a public entry, a hostname or a domain name is refused and audited, so
+/// editing it cannot turn this build back into an internet client.
 ///
 /// Format: one host (`a.b.c.d`) or CIDR (`a.b.c.d/len`) per line; `#` starts a comment. The file
 /// is re-read on every start (`init_allowlist`), not on every packet.
 pub const ALLOWLIST_FILE: &str = "intranet-allowlist.conf";
 
-/// Parsed allow-list behind a read-mostly lock. Empty until `init_allowlist` runs; an empty list
-/// means nothing is reachable except `127.0.0.1`, which is the safe default.
+/// Parsed allow-list behind a read-mostly lock. Installed by `init_allowlist` /
+/// `store_allowlist_text`; when the file names no entry it holds [`DEFAULT_PRIVATE_RANGES`], so the
+/// reachable set is "all private IPv4 space" and never "nothing".
 static ALLOWED_V4_CIDRS: OnceLock<RwLock<Vec<CidrV4>>> = OnceLock::new();
+
+/// Whether [`ALLOWED_V4_CIDRS`] is the operator's narrowing or the private default. Set by
+/// [`install_allowlist`] alongside the table so the two can never disagree; see [`is_narrowed`].
+static NARROWED: AtomicBool = AtomicBool::new(false);
 
 fn allowlist_store() -> &'static RwLock<Vec<CidrV4>> {
     ALLOWED_V4_CIDRS.get_or_init(|| RwLock::new(Vec::new()))
@@ -81,21 +93,26 @@ pub fn allowlist_path() -> PathBuf {
 
 const ALLOWLIST_TEMPLATE: &str = "\
 # Intranet-only allow-list. One IPv4 host (a.b.c.d) or CIDR (a.b.c.d/len) per line.
+#
+# An empty file - or no file at all - is a valid state: the guard then allows every private
+# range listed below and nothing else, so an unconfigured machine still reaches its own LAN.
+# Add lines only to NARROW that to the ranges a deployment actually uses.
 # Only private space is accepted: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16,
-# 100.64.0.0/10 (CGNAT) and 169.254.0.0/16 (link-local). Public addresses are refused.
+# 100.64.0.0/10 (CGNAT) and 169.254.0.0/16 (link-local). Public addresses, hostnames and
+# domain names are refused and audited, so this file can never open a route to the internet.
 # 127.0.0.1 is always reachable for local IPC and does not need an entry.
 #
-# Examples (remove the leading '# ' to activate, and replace with your own ranges):
+# Examples (remove the leading '# ' to restrict traffic to these two only):
 # 192.168.10.0/24
 # 10.20.30.15
 ";
 
 /// Load the allow-list. Called once from `global_init` before the self-check.
 ///
-/// A missing file is created from `ALLOWLIST_TEMPLATE` (all examples commented out), so the
-/// operator has something to edit; a missing file therefore means "only loopback", not "allow
-/// everything". [`store_allowlist_text`] is the other way in - the settings page uses it and does
-/// not need a restart.
+/// A missing file is created from `ALLOWLIST_TEMPLATE` (all examples commented out) so the
+/// operator has something to edit; because the template carries no active entry, that state means
+/// "all private IPv4 space" (see [`effective_allowlist`]), not "nothing is reachable".
+/// [`store_allowlist_text`] is the other way in - the settings page uses it and needs no restart.
 pub fn init_allowlist() {
     let path = allowlist_path();
     let text = match std::fs::read_to_string(&path) {
@@ -115,18 +132,21 @@ pub fn init_allowlist() {
         }
     };
 
-    let count = install_allowlist(allowlist_from_text(&text, "netguard::init_allowlist").0);
-    if count == 0 {
-        crate::log::warn!(
-            "netguard: allow-list is empty ({}); only 127.0.0.1 is reachable. Add your intranet ranges, one per line.",
-            path.display()
-        );
-    } else {
+    let parsed = allowlist_from_text(&text, "netguard::init_allowlist").0;
+    let narrowed = !parsed.is_empty();
+    let count = install_allowlist(parsed);
+    if narrowed {
         crate::log::info!(
-            "netguard: allow-list loaded from {:?}: {} entr{}",
+            "netguard: allow-list loaded from {:?}: {} entr{} (restricted to these ranges)",
             path,
             count,
             if count == 1 { "y" } else { "ies" }
+        );
+    } else {
+        crate::log::info!(
+            "netguard: {:?} has no entry; allowing all private IPv4 space ({} ranges), public targets stay refused",
+            path,
+            count
         );
     }
 }
@@ -147,6 +167,9 @@ pub fn allowlist_text() -> String {
 /// good range and then reported "1 of 2 entries loaded" would leave the operator believing the
 /// public range was allowed; here the edit simply fails and says which line, so the file on disk and
 /// the list in memory cannot disagree.
+///
+/// Saving a file with no active entry is accepted and means "stop narrowing": the count then reports
+/// [`DEFAULT_PRIVATE_RANGES`].len(), which is why the settings card shows a number rather than 0.
 pub fn store_allowlist_text(text: &str) -> ResultType<usize> {
     let (list, rejected) = allowlist_from_text(text, "netguard::store_allowlist_text");
     if !rejected.is_empty() {
@@ -198,14 +221,59 @@ fn allowlist_from_text(text: &str, ctx: &str) -> (Vec<CidrV4>, Vec<String>) {
     (list, rejected)
 }
 
+/// The ranges a file with no active entry stands for: every private block the parser accepts.
+///
+/// This is the out-of-the-box policy, and it is what the requirement actually asks for - 掐掉公网,
+/// not 掐掉内网. It opens nothing: anything outside these five ranges was already unreachable, and
+/// the file can only ever narrow this set, because an entry that is not private space is refused
+/// rather than accepted (`parse_allowlist_entry`).
+const DEFAULT_PRIVATE_RANGES: [([u8; 4], u8); 5] = [
+    ([10, 0, 0, 0], 8),
+    ([172, 16, 0, 0], 12),
+    ([192, 168, 0, 0], 16),
+    ([100, 64, 0, 0], 10),
+    ([169, 254, 0, 0], 16),
+];
+
+/// What a parsed allow-list means: the entries it names, or all private space when it names none.
+///
+/// Kept separate from [`install_allowlist`] so both readings are testable without writing to the
+/// process-wide store that the other `ip_allowed` tests share.
+fn effective_allowlist(parsed: Vec<CidrV4>) -> Vec<CidrV4> {
+    if !parsed.is_empty() {
+        return parsed;
+    }
+    DEFAULT_PRIVATE_RANGES
+        .iter()
+        .map(|(octets, prefix)| CidrV4::new(*octets, *prefix))
+        .collect()
+}
+
 /// Swap the parsed list into the process-wide store and report how many entries it holds.
-fn install_allowlist(list: Vec<CidrV4>) -> usize {
+///
+/// Also records whether the list came from the operator's file or from [`DEFAULT_PRIVATE_RANGES`],
+/// which is the difference the settings page has to state correctly: "5 entries" is a narrowed
+/// deployment and "5 entries" is also the untouched default.
+fn install_allowlist(parsed: Vec<CidrV4>) -> usize {
+    let narrowed = !parsed.is_empty();
+    let list = effective_allowlist(parsed);
     let count = list.len();
-    let mut guard = allowlist_store()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *guard = list;
+    {
+        let mut guard = allowlist_store()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = list;
+    }
+    NARROWED.store(narrowed, Ordering::Relaxed);
     count
+}
+
+/// True when `intranet-allowlist.conf` names at least one entry, so the live table is the operator's
+/// narrowing rather than all private space. Read by the settings card (`main_intranet_allowlist_narrowed`)
+/// and by [`init_allowlist`]'s startup log; a process that has not installed a list yet reports
+/// `false`, which is the honest answer - nothing has narrowed it.
+pub fn is_narrowed() -> bool {
+    NARROWED.load(Ordering::Relaxed)
 }
 
 /// One line of the allow-list. Refusals carry the audit `reason=`.
@@ -631,16 +699,15 @@ pub const FORCED_OPTIONS: &[(&str, &str)] = &[
     ("proxy-url", ""),
     ("proxy-username", ""),
     ("proxy-password", ""),
-    // Belt and braces: the inbound server-layer check (`src/server/connection.rs:1410`) keeps
-    // working with the same value even though the real enforcement is `ip_allowed` above.
-    // Upstream's own inbound whitelist is a second, weaker list (it never sees outbound connects
-    // and would silently shadow the operator's allow-list). Keep it empty; netguard is the only
-    // authority.
-    ("whitelist", ""),
-    // No per-ID gate: the operator's allow-listed segments are the boundary, and an empty id list is
-    // what "any id from an allowed address" means. A stale non-empty value here would only break
-    // legitimate peers.
-    ("id-whitelist", ""),
+    // `whitelist` and `id-whitelist` are deliberately NOT pinned here; an earlier revision of this
+    // fork emptied both, which was scope creep: they are *inbound* access controls checked against
+    // the accepted socket (`src/server/connection.rs:1410`) and against the id the controller
+    // declares (`:1439`), so they have nothing to do with reaching the internet, and pinning them
+    // greyed out two working upstream cards. They are upstream's again. Note the difference in
+    // strength when reading those cards: the IP list is bound to the peer address and cannot be
+    // faked from the other side, while `my_id` is a self-reported, unsigned string - good for
+    // keeping a mistyped address out, not an access control. Neither can widen `ip_allowed`: a
+    // target outside the allow-list is refused before either check ever sees a packet.
     // 需求 §一「双向直连」的正向开关。`option2bool` treats `direct-server` as `== "Y"` (空值 = 关,
     // `config.rs:2842`), and it is the *only* thing that puts a listener on the direct port
     // (`src/direct_access.rs::direct_server`) - the port the controller dials when the user types a
@@ -674,6 +741,23 @@ pub fn force_option(key: &str) -> Option<String> {
         .find(|(k, _)| *k == key)
         .map(|(_, v)| (*v).to_owned())
 }
+
+/// The hosted-account feature, switched off with upstream's own key.
+///
+/// 步 6-L3 deleted the account *transport*: `src/hbbs_http.rs` keeps no HTTP client, so the login
+/// dialog could only ever answer "Account login is removed from this build". What it did not delete
+/// was the *entry* to that dialog, because upstream hides the whole account area behind one check -
+/// `hbb_common::config::is_disable_account()` - and only ever turns it on for a custom client, whose
+/// `custom.txt` fills `HARD_SETTINGS` (`src/common.rs:1737-1744`). This build is a normal-named
+/// client, nothing set the key, and the settings sidebar went on offering an 账户 page
+/// (`flutter/lib/desktop/pages/desktop_setting_page.dart:75`), a "note at connection end" row
+/// (`:617`), a Note item in the session toolbar (`flutter/lib/common/widgets/toolbar.dart:481`) and
+/// the account-backed address-book / device-group tabs
+/// (`flutter/lib/models/peer_tab_model.dart:44-45`) that all lead to it.
+///
+/// Answering the check here instead of deleting Dart keeps the hiding upstream's own logic: an
+/// account entry that a future rebase moves still moves behind the same flag.
+pub const CLOUD_ACCOUNT_REMOVED: bool = true;
 
 /// The one port the direct pair uses, in both directions.
 ///
@@ -1067,12 +1151,31 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_allowlist_is_valid_input_not_an_error() {
-        // Closing the gate has to be an edit the card accepts, otherwise the only way to reach
-        // deny-all is by hand.
+    fn an_empty_allowlist_means_the_private_default_not_deny_all() {
+        // The out-of-the-box reading: no active entry ⇒ all private space. 掐掉公网 is the
+        // requirement; an unconfigured machine still has to reach its own LAN.
         let (list, rejected) = allowlist_from_text("", "netguard::test::empty");
         assert!(list.is_empty());
         assert!(rejected.is_empty(), "{:?}", rejected);
+
+        let expected: Vec<CidrV4> = DEFAULT_PRIVATE_RANGES
+            .iter()
+            .map(|(octets, prefix)| CidrV4::new(*octets, *prefix))
+            .collect();
+        assert_eq!(effective_allowlist(list), expected);
+        for (octets, prefix) in DEFAULT_PRIVATE_RANGES {
+            // Every default must survive `startup_self_check`, which refuses a non-private entry.
+            assert!(
+                is_private_intranet(CidrV4::new(octets, prefix).base(), prefix),
+                "{:?}/{} is not private space",
+                octets,
+                prefix
+            );
+        }
+
+        // Listing one range narrows instead of widening: the entries win verbatim.
+        let (one, _) = allowlist_from_text("192.168.10.0/24", "netguard::test::narrowed");
+        assert_eq!(effective_allowlist(one.clone()), one);
 
         // A refused line refuses the whole write, before anything touches the config directory.
         // (Only the refusal branch is exercised here - the accepting branch writes the real file.)
@@ -1201,14 +1304,21 @@ mod tests {
             assert!(is_forced_key(k), "{} is purged but not pinned", k);
             assert!(is_policy_key(k));
         }
-        // Pinned without naming a server: the positive switch, the relay window, and the upstream
-        // peer-ID gate that must stay empty so netguard's allow-list is the only inbound authority.
+        // Pinned without naming a server: the positive switch and the relay window.
         // (These are deliberately not in `SERVER_SHAPED_KEYS`: `direct-server` = "Y" is what the build
         // *wants* stored nowhere, but the pin itself is the guarantee, so the purge dropping it is
         // fine.)
-        for k in ["direct-server", "relay-fallback-delay", "id-whitelist"] {
+        for k in ["direct-server", "relay-fallback-delay"] {
             assert!(is_forced_key(k), "{}", k);
             assert!(is_policy_key(k), "{}", k);
+        }
+        // The two upstream *inbound* gates are deliberately not pinned. They restrict who may reach
+        // this machine - the opposite of egress - and neither can widen `ip_allowed`, so the fork has
+        // no reason to take them away from the operator (see the `FORCED_OPTIONS` comment).
+        for k in ["whitelist", "id-whitelist"] {
+            assert!(!is_forced_key(k), "{} must stay operator-editable", k);
+            assert!(!is_policy_key(k), "{}", k);
+            assert_eq!(force_option(k), None);
         }
         // `direct-access-port` is the opposite case: deliberately *not* pinned, so the operator can
         // move the direct pair off 21118 when that port is not usable on their network. Both halves
@@ -1231,6 +1341,19 @@ mod tests {
         // Nothing else is pinned - `lang` is the stand-in for an ordinary option.
         assert_eq!(force_option("lang"), None);
         assert!(!is_policy_key("lang"));
+    }
+
+    #[test]
+    fn the_cloud_account_ui_is_hidden_through_upstreams_own_check() {
+        // The account *transport* is gone (步 6-L3), so what has to stay true is that no entry to it
+        // is offered. Upstream's readers ask `is_disable_account()`, which this fork answers instead
+        // of setting custom-client `HARD_SETTINGS`; a typo in the key upstream itself reads, or in
+        // the constant, would silently put an 账户 page back into the settings sidebar.
+        //
+        // Asserting through `config::` rather than reading the constant is deliberate - it is the
+        // answer every Dart consumer sees. It also holds regardless of what HARD_SETTINGS contains,
+        // which matters because other tests in this binary replace that map concurrently.
+        assert!(crate::config::is_disable_account());
     }
 
     #[test]

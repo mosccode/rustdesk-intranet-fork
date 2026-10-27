@@ -133,7 +133,7 @@ Future<void> initEnv(String appType) async {
 void runMainApp(bool startService) async {
   // register uni links
   await initEnv(kAppTypeMain);
-  checkUpdate();
+  // upstream's checkUpdate() call is removed here - see the note in common.dart.
   // trigger connection status updater
   await bind.mainCheckConnectStatus();
   if (startService) {
@@ -175,7 +175,7 @@ void runMainApp(bool startService) async {
 
 void runMobileApp() async {
   await initEnv(kAppTypeMain);
-  checkUpdate();
+  // upstream's checkUpdate() call is removed here too - see the note in common.dart.
   if (isAndroid) androidChannelInit();
   if (isAndroid) platformFFI.syncAndroidServiceAppDirConfigPath();
   draggablePositions.load();

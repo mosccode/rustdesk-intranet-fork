@@ -1668,10 +1668,18 @@ pub fn main_intranet_allowlist_path() -> SyncReturn<String> {
     )
 }
 
-/// Entries this process enforces right now. `0` means only `127.0.0.1` is reachable - the expected
-/// reading on an install nobody has configured yet.
+/// Entries this process enforces right now. An un-narrowed install reports the private default -
+/// every range in `netguard::DEFAULT_PRIVATE_RANGES`, not zero - so read this together with
+/// [`main_intranet_allowlist_narrowed`]: the count says how many, the flag says whose.
 pub fn main_intranet_allowlist_count() -> SyncReturn<i32> {
     SyncReturn(hbb_common::netguard::allowed_cidrs().len() as i32)
+}
+
+/// `false` = the file names no entry and the guard allows all private IPv4 space; `true` = the file
+/// narrows it to the listed ranges. Without this the card could not tell a fresh install (5 default
+/// ranges) apart from a deployment that deliberately listed five ranges.
+pub fn main_intranet_allowlist_narrowed() -> SyncReturn<bool> {
+    SyncReturn(hbb_common::netguard::is_narrowed())
 }
 
 /// True when this machine has a permanent password to check an edit against. Without one there is
@@ -1871,8 +1879,11 @@ pub fn main_get_last_remote_id() -> String {
 }
 
 /// netguard L2 (步 6-C): the update module is deleted, so this FFI entry no longer starts a check.
-/// The symbol is kept (the Flutter menu still binds `mainGetSoftwareUpdateUrl`) and answers with a
-/// log line instead of dialling anything; 步 7 removes the menu entry that calls it.
+/// The symbol is kept because the generated bridge still declares it and mobile's settings page
+/// compiles against the same surface; it answers with a log line instead of dialling anything.
+/// The desktop callers are gone - 步 7 removed the menu entry, and this round removed `checkUpdate()`
+/// with its two startup call sites plus the two update switches on the desktop settings page, so no
+/// shipped target reaches this function any more.
 pub fn main_get_software_update_url() {
     log::warn!(
         "Software update check is removed from this build (netguard L2); nothing was contacted."

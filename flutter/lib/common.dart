@@ -3891,22 +3891,13 @@ void earlyAssert() {
   assert('\1' == '1');
 }
 
-void checkUpdate() {
-  if (!isWeb) {
-    if (!bind.isCustomClient()) {
-      platformFFI.registerEventHandler(
-          kCheckSoftwareUpdateFinish, kCheckSoftwareUpdateFinish,
-          (Map<String, dynamic> evt) async {
-        if (evt['url'] is String) {
-          stateGlobal.updateUrl.value = evt['url'];
-        }
-      });
-      Timer(const Duration(seconds: 1), () async {
-        bind.mainGetSoftwareUpdateUrl();
-      });
-    }
-  }
-}
+// netguard L2 (步 6-C): upstream's `checkUpdate()` is deleted, together with its two call sites in
+// `main.dart` (`runMainApp` / `runMobileApp`). It registered a `check_software_update_finish`
+// handler and, one second after start, called `mainGetSoftwareUpdateUrl()` - which in this build is
+// a stub that logs and contacts nothing (`src/flutter_ffi.rs`), because the whole update module and
+// the HTTP client it used are gone. The switch for it is off the settings page too, and
+// `enable-check-update` / `allow-auto-update` stay pinned to `N` in `FORCED_OPTIONS`, so the file,
+// the UI and the binary tell the same story: this build never looks for a newer version.
 
 // https://github.com/flutter/flutter/issues/153560#issuecomment-2497160535
 // For TextField, TextFormField

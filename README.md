@@ -1,8 +1,8 @@
 # Intranet-only RustDesk fork (unofficial)
 
 This is an unofficial fork of [RustDesk](https://github.com/rustdesk/rustdesk) 1.5.0 for
-**isolated intranets**. It keeps the remote-desktop function and removes the ability to talk to
-anything outside a local allow-list.
+**isolated intranets**. It keeps the remote-desktop function and removes every path to the public
+internet: out of the build, not just out of the configuration.
 
 It is **not affiliated with or endorsed by the RustDesk project**. "RustDesk" is the name of the
 upstream project and remains the property of its owners; this repository only describes the code
@@ -14,19 +14,23 @@ it was forked from.
   status, software update checks, NAT-type probing and the hosted HTTP clients are removed from
   the build, not merely disabled by configuration.
 - **One network guard for every socket.** `libs/hbb_common/src/netguard.rs` checks every outbound
-  connect/send and every inbound accept/datagram. A target that is not on the allow-list is
-  refused with an audit line; there is no retry and no fallback transport.
+  connect/send and every inbound accept/datagram. Anything outside private IPv4 space is refused
+  with an audit line; there is no retry and no fallback transport.
 - **Direct connections only.** A peer is reached by entering a literal IP address; the connection
   goes to TCP 21118 on that address. If the direct connection fails, the session fails - it does
   not fall back to a relay.
-- **The allow-list is yours, not the source code's.** Edit
+- **The allow-list is yours, not the source code's - and it is optional.** Nothing has to be
+  configured to get an intranet working: with no entries the guard allows all private space
+  (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`) and nothing else. Listing ranges
+  narrows that set, which is what a site that wants "only these two subnets" uses. Edit
   `intranet-allowlist.conf` in the application config directory, or use the editor under Settings ·
   Security (see Configuration below). Only private IPv4 space is accepted; public addresses are
   rejected and logged, so a configuration mistake cannot turn this build back into an internet
   client.
 - **Server-shaped settings are removed.** The ID/relay-server dialog, proxy dialog, WebSocket
   switch, generic server test, `id@server` targets and domain-name targets are gone or fail
-  before dialing.
+  before dialing. The cloud-account and software-update entries are hidden too, so the settings
+  pages offer no switch that this build cannot honour.
 
 ## Download and build
 
@@ -57,8 +61,9 @@ scan over the produced binaries.
 ### Editing the allow-list inside the app
 
 **Settings · Security · Intranet direct-connect allow-list** (`Edit`) opens the file in the app
-itself: it shows how many entries the guard is enforcing right now and the exact path of the file
-for this build, then lets you add and remove lines and save. Saving validates with the same rules
+itself: it says whether the guard is currently narrowed to the listed ranges or standing at the
+private default, how many entries that means, and the exact path of the file for this build; then it
+lets you add and remove lines and save. Saving validates with the same rules
 as startup - one refused line refuses the whole save and names the line - and reloads the list in
 the running process, so the machine you are typing on can connect immediately without a restart.
 
@@ -66,7 +71,7 @@ On an **installed** build the whole Security page starts read-only: that is upst
 you clear it with the **Unlock security settings** card at the top of the page (UAC prompt, or the
 unlock PIN if one was set). The portable build does not show that gate. Nothing in this fork pins
 the allow-list card, the port box or any other control that is not listed as a forced option -
-`enable-lan-discovery`, `direct-server` and the two upstream whitelists stay grey on purpose.
+`enable-lan-discovery` and `direct-server` stay grey on purpose.
 
 Two honest limits:
 
@@ -79,11 +84,15 @@ Two honest limits:
   side that **accepts** incoming connections picks the file up on its next start, so after changing
   it on a controlled machine restart that program (or the service).
 
-The two upstream cards **Use IP Whitelisting** and **Use ID whitelisting** are gone from the desktop
-settings page. `whitelist` and `id-whitelist` are pinned empty by this build's forced options, so
-every value they wrote came back empty on the next read while the checkbox still looked usable; a
-control that silently drops your input is worse than no control. The card above writes to what the
-guard actually reads.
+The two upstream cards **Use IP Whitelisting** and **Use ID whitelisting** behave as they do
+upstream: they are inbound access controls, checked against the peer address of the accepted socket
+and against the id the controller announces, and they have nothing to do with reaching the internet.
+An earlier revision of this fork pinned both empty and deleted the cards, which was scope creep - a
+greyed-out control that silently drops your input is worse than no control. Read the two cards with
+their real strengths: the IP list is bound to the connection and cannot be faked from the other side,
+while an id is self-reported and carries no signature, so it keeps out a mistyped address rather than
+an attacker. Neither one widens the guard above; a target outside the allow-list is refused before
+either check sees a packet.
 
 ### Editing the file directly
 
@@ -103,8 +112,10 @@ Edit it (or use the card above), one entry per line:
 ```
 
 Accepted ranges are RFC1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64/10`) and
-link-local (`169.254/16`). `127.0.0.1` is always reachable for local IPC. An empty file means
-nothing is reachable; that is the default.
+link-local (`169.254/16`). `127.0.0.1` is always reachable for local IPC. An empty file - or no file
+at all - means **no narrowing**: every range listed above is reachable, which is the out-of-the-box
+state a site with nothing to restrict leaves it in. Entries only take ranges away, and the settings
+card says which of the two states you are in.
 
 Every refused target is appended to `netguard-audit.log` in the same directory, and mirrored to
 the normal application log.

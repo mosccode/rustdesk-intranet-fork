@@ -3076,7 +3076,10 @@ pub fn is_disable_ab() -> bool {
 
 #[inline]
 pub fn is_disable_account() -> bool {
-    is_some_hard_opton("disable-account")
+    // netguard L3 (步 6-L3): this build links no account transport, so it reports the account
+    // feature as disabled through upstream's own check instead of editing the UI that reads it.
+    // See `crate::netguard::CLOUD_ACCOUNT_REMOVED` for which entries that hides.
+    crate::netguard::CLOUD_ACCOUNT_REMOVED || is_some_hard_opton("disable-account")
 }
 
 #[inline]
