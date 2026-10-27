@@ -1,0 +1,19 @@
+Intranet-only RustDesk fork
+===========================
+
+This distribution is a modified version of RustDesk 1.5.0:
+
+    https://github.com/rustdesk/rustdesk
+
+RustDesk is Copyright (C) the RustDesk contributors and is licensed under the
+GNU Affero General Public License, version 3 (see LICENCE).
+
+Modifications for this fork are Copyright (C) 2026 the contributors of this
+repository and are released under the same license, AGPL-3.0.
+
+The modifications are described in MODIFICATIONS.md. The complete corresponding
+source for every binary published from this repository is this repository at the
+commit named in the release notes.
+
+This is an unofficial fork. It is not affiliated with or endorsed by the RustDesk
+project. The name "RustDesk" is used only to identify the upstream work.

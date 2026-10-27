@@ -1,0 +1,2656 @@
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex, RwLock},
+    task::Poll,
+};
+
+use serde_json::{json, Map, Value};
+
+use base::{config::keys, message_proto::*};
+#[cfg(not(target_os = "ios"))]
+use hbb_common::whoami;
+use hbb_common::{
+    anyhow::{anyhow, Context},
+    bail, base64,
+    bytes::Bytes,
+    config::{self, use_ws, Config, LocalConfig, CONNECT_TIMEOUT, READ_TIMEOUT, RENDEZVOUS_PORT},
+    futures_util::future::poll_fn,
+    get_version_number, log,
+    protobuf::{Enum, Message as _},
+    rendezvous_proto::*,
+    sodiumoxide::crypto::{box_, secretbox, sign},
+    timeout,
+    tokio::{
+        self,
+        net::UdpSocket,
+        time::{Duration, Instant, Interval},
+    },
+    ResultType, Stream,
+};
+
+use crate::ui_interface::{get_option, is_installed, set_option};
+
+#[derive(Debug, Eq, PartialEq)]
+pub enum GrabState {
+    Ready,
+    Run,
+    Wait,
+    Exit,
+}
+
+pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Output = ()>;
+
+// the executable name of the portable version
+pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
+
+pub const PLATFORM_WINDOWS: &str = "Windows";
+pub const PLATFORM_LINUX: &str = "Linux";
+pub const PLATFORM_MACOS: &str = "Mac OS";
+pub const PLATFORM_ANDROID: &str = "Android";
+
+pub const TIMER_OUT: Duration = Duration::from_secs(1);
+pub(crate) const API_LOG_INTERVAL: Duration = Duration::from_secs(600);
+pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
+
+const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
+
+pub mod input {
+    pub const MOUSE_TYPE_MOVE: i32 = 0;
+    pub const MOUSE_TYPE_DOWN: i32 = 1;
+    pub const MOUSE_TYPE_UP: i32 = 2;
+    pub const MOUSE_TYPE_WHEEL: i32 = 3;
+    pub const MOUSE_TYPE_TRACKPAD: i32 = 4;
+    /// Relative mouse movement type for gaming/3D applications.
+    /// This type sends delta (dx, dy) values instead of absolute coordinates.
+    /// NOTE: This is only supported by the Flutter client. The Sciter client (deprecated)
+    /// does not support relative mouse mode due to:
+    /// 1. Fixed send_mouse() function signature that doesn't allow type differentiation
+    /// 2. Lack of pointer lock API in Sciter/TIS
+    /// 3. No OS cursor control (hide/show/clip) FFI bindings in Sciter UI
+    pub const MOUSE_TYPE_MOVE_RELATIVE: i32 = 5;
+
+    /// Mask to extract the mouse event type from the mask field.
+    /// The lower 3 bits contain the event type (MOUSE_TYPE_*), giving a valid range of 0-7.
+    /// Currently defined types use values 0-5; values 6 and 7 are reserved for future use.
+    pub const MOUSE_TYPE_MASK: i32 = 0x7;
+
+    pub const MOUSE_BUTTON_LEFT: i32 = 0x01;
+    pub const MOUSE_BUTTON_RIGHT: i32 = 0x02;
+    pub const MOUSE_BUTTON_WHEEL: i32 = 0x04;
+    pub const MOUSE_BUTTON_BACK: i32 = 0x08;
+    pub const MOUSE_BUTTON_FORWARD: i32 = 0x10;
+}
+
+lazy_static::lazy_static! {
+    pub static ref DEVICE_ID: Arc<Mutex<String>> = Default::default();
+    pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
+}
+
+lazy_static::lazy_static! {
+    // Is server process, with "--server" args
+    static ref IS_SERVER: bool = std::env::args().nth(1) == Some("--server".to_owned());
+    // Is server logic running. The server code can invoked to run by the main process if --server is not running.
+    static ref SERVER_RUNNING: Arc<RwLock<bool>> = Default::default();
+    static ref IS_MAIN: bool = std::env::args().nth(1).map_or(true, |arg| !arg.starts_with("--"));
+    static ref IS_CM: bool = std::env::args().nth(1) == Some("--cm".to_owned());
+}
+
+pub struct SimpleCallOnReturn {
+    pub b: bool,
+    pub f: Box<dyn Fn() + Send + 'static>,
+}
+
+impl Drop for SimpleCallOnReturn {
+    fn drop(&mut self) {
+        if self.b {
+            (self.f)();
+        }
+    }
+}
+
+/// netguard 步 5 (需求 §二.5/§二.7, 设计方案 §8.5): the earliest code that runs in *every* process of
+/// this build - `core_main.rs:33` (desktop UI, the `--server` service, `--cm` and every subprocess that
+/// goes through `core_main`), `main.rs:10` and `flutter_ffi.rs:78` (Android/iOS) all call it before
+/// anything touches the network, which is why the config policy is enforced here instead of per entry
+/// point.
+///
+/// Two separate jobs, deliberately with different severity:
+///
+/// 1. `Config::netguard_purge_policy_keys()` - housekeeping, never fatal: it deletes from the persisted
+///    configs every key this build decides for itself (pinned options and server-shaped ones, one audit
+///    line per key). A tampered value could not take effect anyway - the option reads go through
+///    `config::get_or`, which answers from the compiled policy - so the purge exists to stop the *file*
+///    describing a server the binary cannot dial. 决策点 D-3 said
+///    「配置冲突不阻断启动」, 需人工确认 - refusing to start would turn a stale file into a denial of
+///    service against the user, which is the failure mode 设计方案 §6 rejects.
+/// 2. `netguard::startup_self_check()` - fatal: it inspects the *compiled* policy (allow-list not empty,
+///    prefixes sane, the addresses the acceptance test expects refused really are refused). If that is
+///    broken there is no trustworthy boundary left to enforce, so the process must not start. Returning
+///    `false` here makes `core_main`/`main.rs` exit. On Android/iOS `flutter_ffi.rs:78` ignores the
+///    value - still fail-closed, because a broken allow-list makes the guard refuse every address; it
+///    just exits quietly instead of loudly there.
+///
+/// Note on log visibility: on desktop `init_log` only runs later (`core_main.rs:169`), so the mirrored
+/// `log::warn!` of these startup lines may be dropped; the `netguard-audit.log` append inside
+/// `audit_denied` is file-direct and is not. 未验证（本机无 cargo/运行环境）。
+pub fn global_init() -> bool {
+    // 1. config sweep (reports but does not block).
+    let purged = Config::netguard_purge_policy_keys();
+    if purged > 0 {
+        log::warn!(
+            "netguard: startup sweep dropped {} policy-shaped option(s) from the config (see netguard-audit.log)",
+            purged
+        );
+    }
+    // 2. operator allow-list (creates a commented template on first run) and compiled-policy
+    //    self check (blocks).
+    hbb_common::netguard::init_allowlist();
+    let problems = hbb_common::netguard::startup_self_check();
+    if !problems.is_empty() {
+        for problem in problems.iter() {
+            hbb_common::netguard::audit_denied(
+                "local",
+                "netguard-policy",
+                "common::global_init",
+                &format!("reason=compiled_policy_self_check_failed detail=\"{}\"", problem),
+            );
+        }
+        log::error!(
+            "netguard: compiled policy failed its startup self-check ({} problem(s)), refusing to start",
+            problems.len()
+        );
+        return false;
+    }
+    #[cfg(all(target_os = "linux", feature = "drm"))]
+    crate::platform::linux::dispatch_wayland_display_probe();
+    #[cfg(target_os = "linux")]
+    {
+        if !crate::platform::linux::is_x11() {
+            crate::server::wayland::init();
+        }
+    }
+    true
+}
+
+pub fn global_clean() {}
+
+#[inline]
+pub fn set_server_running(b: bool) {
+    *SERVER_RUNNING.write().unwrap() = b;
+}
+
+#[inline]
+pub fn is_support_multi_ui_session(ver: &str) -> bool {
+    is_support_multi_ui_session_num(hbb_common::get_version_number(ver))
+}
+
+#[inline]
+pub fn is_support_multi_ui_session_num(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number(MIN_VER_MULTI_UI_SESSION)
+}
+
+/// Peers from the 1.5.0 release name a cursor by `cursor_content_id`; older ones by the
+/// platform handle, which apps mint anew for the same shape.
+#[inline]
+pub fn is_peer_naming_cursors_by_content(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number("1.5.0")
+}
+
+/// One id per cursor look, however many handles a platform gives it. Held to 53 bits: the web
+/// client decodes a u64 into a JS number and drops the whole message when it does not fit.
+pub fn cursor_content_id(width: i32, height: i32, hotx: i32, hoty: i32, colors: &[u8]) -> u64 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for v in [width, height, hotx, hoty] {
+        hasher.update(&v.to_le_bytes());
+    }
+    hasher.update(colors);
+    hasher.digest() & ((1 << 53) - 1)
+}
+
+#[inline]
+#[cfg(feature = "unix-file-copy-paste")]
+pub fn is_support_file_copy_paste(ver: &str) -> bool {
+    is_support_file_copy_paste_num(hbb_common::get_version_number(ver))
+}
+
+#[inline]
+#[cfg(feature = "unix-file-copy-paste")]
+pub fn is_support_file_copy_paste_num(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number("1.3.8")
+}
+
+pub fn is_support_remote_print(ver: &str) -> bool {
+    hbb_common::get_version_number(ver) >= hbb_common::get_version_number("1.3.9")
+}
+
+pub fn is_support_file_paste_if_macos(ver: &str) -> bool {
+    hbb_common::get_version_number(ver) >= hbb_common::get_version_number("1.3.9")
+}
+
+#[inline]
+pub fn is_support_screenshot(ver: &str) -> bool {
+    is_support_multi_ui_session_num(hbb_common::get_version_number(ver))
+}
+
+#[inline]
+pub fn is_support_screenshot_num(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number("1.4.0")
+}
+
+#[inline]
+pub fn is_support_file_transfer_resume(ver: &str) -> bool {
+    is_support_file_transfer_resume_num(hbb_common::get_version_number(ver))
+}
+
+#[inline]
+pub fn is_support_file_transfer_resume_num(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number("1.4.2")
+}
+
+/// Minimum server version required for relative mouse mode support.
+/// This constant must mirror Flutter's `kMinVersionForRelativeMouseMode` in `consts.dart`.
+const MIN_VERSION_RELATIVE_MOUSE_MODE: &str = "1.4.5";
+
+#[inline]
+pub fn is_support_relative_mouse_mode(ver: &str) -> bool {
+    is_support_relative_mouse_mode_num(hbb_common::get_version_number(ver))
+}
+
+#[inline]
+pub fn is_support_relative_mouse_mode_num(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number(MIN_VERSION_RELATIVE_MOUSE_MODE)
+}
+
+// is server process, with "--server" args
+#[inline]
+pub fn is_server() -> bool {
+    *IS_SERVER
+}
+
+#[inline]
+pub fn need_fs_cm_send_files() -> bool {
+    #[cfg(windows)]
+    {
+        is_server()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Android is scoped-storage only: the peer may never touch anything outside the app
+/// workspace (`Config::get_home()`, i.e. the app-specific external files directory).
+///
+/// Every peer supplied path must be validated with this before it reaches the
+/// filesystem, for reads, writes, renames, creations and deletions alike. The path is
+/// resolved to its canonical form (of the deepest existing ancestor, so paths that are
+/// about to be created are handled too) so symlinks cannot escape the workspace.
+///
+/// Only the `ReadDir` protocol action treats an empty path as the home directory.
+/// Callers must opt in to that protocol-specific behavior with `allow_empty`.
+#[cfg(target_os = "android")]
+pub fn is_peer_path_allowed(path: &str, allow_empty: bool) -> bool {
+    use std::path::{Component, Path, PathBuf};
+
+    // Canonicalize the deepest existing ancestor and re-append the missing tail.
+    fn resolve(path: &Path) -> Option<PathBuf> {
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        let mut base = path.to_path_buf();
+        loop {
+            if let Ok(mut resolved) = base.canonicalize() {
+                while let Some(component) = tail.pop() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            tail.push(base.file_name()?.to_os_string());
+            if !base.pop() {
+                return None;
+            }
+        }
+    }
+
+    if path.is_empty() {
+        return allow_empty;
+    }
+    let path = Path::new(path);
+    // `..` is never needed by the protocol and would defeat the prefix check below.
+    if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+        return false;
+    }
+    let home = Config::get_home();
+    let home = home.canonicalize().unwrap_or(home);
+    if home.as_os_str().is_empty() {
+        return false;
+    }
+    // `Path::starts_with` compares whole components, and is true for equal paths.
+    resolve(path).map_or(false, |target| target.starts_with(&home))
+}
+
+#[inline]
+#[cfg(not(target_os = "android"))]
+pub fn is_peer_path_allowed(_path: &str, _allow_empty: bool) -> bool {
+    true
+}
+
+#[inline]
+pub fn is_main() -> bool {
+    *IS_MAIN
+}
+
+#[inline]
+pub fn is_cm() -> bool {
+    *IS_CM
+}
+
+// Is server logic running.
+#[inline]
+pub fn is_server_running() -> bool {
+    *SERVER_RUNNING.read().unwrap()
+}
+
+#[inline]
+pub fn valid_for_numlock(evt: &KeyEvent) -> bool {
+    if let Some(key_event::Union::ControlKey(ck)) = evt.union {
+        let v = ck.value();
+        (v >= ControlKey::Numpad0.value() && v <= ControlKey::Numpad9.value())
+            || v == ControlKey::Decimal.value()
+    } else {
+        false
+    }
+}
+
+/// Set sound input device.
+pub fn set_sound_input(device: String) {
+    let prior_device = get_option("audio-input".to_owned());
+    if prior_device != device {
+        log::info!("switch to audio input device {}", device);
+        std::thread::spawn(move || {
+            set_option("audio-input".to_owned(), device);
+        });
+    } else {
+        log::info!("audio input is already set to {}", device);
+    }
+}
+
+/// Get system's default sound input device name.
+#[inline]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn get_default_sound_input() -> Option<String> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        let dev = host.default_input_device();
+        return if let Some(dev) = dev {
+            match dev.name() {
+                Ok(name) => Some(name),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let input = crate::platform::linux::get_default_pa_source();
+        return if let Some(input) = input {
+            Some(input.1)
+        } else {
+            None
+        };
+    }
+}
+
+#[inline]
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub fn get_default_sound_input() -> Option<String> {
+    None
+}
+
+#[cfg(feature = "use_rubato")]
+pub fn resample_channels(
+    data: &[f32],
+    sample_rate0: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Vec<f32> {
+    use rubato::{
+        InterpolationParameters, InterpolationType, Resampler, SincFixedIn, WindowFunction,
+    };
+    let params = InterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: InterpolationType::Nearest,
+        oversampling_factor: 160,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    let mut resampler = SincFixedIn::<f64>::new(
+        sample_rate as f64 / sample_rate0 as f64,
+        params,
+        data.len() / (channels as usize),
+        channels as _,
+    );
+    let mut waves_in = Vec::new();
+    if channels == 2 {
+        waves_in.push(
+            data.iter()
+                .step_by(2)
+                .map(|x| *x as f64)
+                .collect::<Vec<_>>(),
+        );
+        waves_in.push(
+            data.iter()
+                .skip(1)
+                .step_by(2)
+                .map(|x| *x as f64)
+                .collect::<Vec<_>>(),
+        );
+    } else {
+        waves_in.push(data.iter().map(|x| *x as f64).collect::<Vec<_>>());
+    }
+    if let Ok(x) = resampler.process(&waves_in) {
+        if x.is_empty() {
+            Vec::new()
+        } else if x.len() == 2 {
+            x[0].chunks(1)
+                .zip(x[1].chunks(1))
+                .flat_map(|(a, b)| a.into_iter().chain(b))
+                .map(|x| *x as f32)
+                .collect()
+        } else {
+            x[0].iter().map(|x| *x as f32).collect()
+        }
+    } else {
+        Vec::new()
+    }
+}
+
+#[cfg(all(feature = "use_dasp", feature = "use_samplerate"))]
+compile_error!(
+    "features `use_dasp` and `use_samplerate` are mutually exclusive; disable default features before selecting `use_samplerate`"
+);
+
+#[cfg(feature = "use_dasp")]
+pub fn audio_resample(
+    data: &[f32],
+    sample_rate0: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Vec<f32> {
+    use dasp::{interpolate::linear::Linear, signal, Signal};
+    let n = data.len() / (channels as usize);
+    let n = n * sample_rate as usize / sample_rate0 as usize;
+    if channels == 2 {
+        let mut source = signal::from_interleaved_samples_iter::<_, [_; 2]>(data.iter().cloned());
+        let a = source.next();
+        let b = source.next();
+        let interp = Linear::new(a, b);
+        let mut data = Vec::with_capacity(n << 1);
+        for x in source
+            .from_hz_to_hz(interp, sample_rate0 as _, sample_rate as _)
+            .take(n)
+        {
+            data.push(x[0]);
+            data.push(x[1]);
+        }
+        data
+    } else {
+        let mut source = signal::from_iter(data.iter().cloned());
+        let a = source.next();
+        let b = source.next();
+        let interp = Linear::new(a, b);
+        source
+            .from_hz_to_hz(interp, sample_rate0 as _, sample_rate as _)
+            .take(n)
+            .collect()
+    }
+}
+
+#[cfg(all(feature = "use_samplerate", not(feature = "use_dasp")))]
+pub fn audio_resample(
+    data: &[f32],
+    sample_rate0: u32,
+    sample_rate: u32,
+    channels: u16,
+) -> Vec<f32> {
+    use samplerate::{convert, ConverterType};
+    convert(
+        sample_rate0 as _,
+        sample_rate as _,
+        channels as _,
+        ConverterType::SincBestQuality,
+        data,
+    )
+    .unwrap_or_default()
+}
+
+pub fn audio_rechannel(
+    input: Vec<f32>,
+    in_hz: u32,
+    out_hz: u32,
+    in_chan: u16,
+    output_chan: u16,
+) -> Vec<f32> {
+    if in_chan == output_chan {
+        return input;
+    }
+    let mut input = input;
+    input.truncate(input.len() / in_chan as usize * in_chan as usize);
+    match (in_chan, output_chan) {
+        (1, 2) => audio_rechannel_1_2(&input, in_hz, out_hz),
+        (1, 3) => audio_rechannel_1_3(&input, in_hz, out_hz),
+        (1, 4) => audio_rechannel_1_4(&input, in_hz, out_hz),
+        (1, 5) => audio_rechannel_1_5(&input, in_hz, out_hz),
+        (1, 6) => audio_rechannel_1_6(&input, in_hz, out_hz),
+        (1, 7) => audio_rechannel_1_7(&input, in_hz, out_hz),
+        (1, 8) => audio_rechannel_1_8(&input, in_hz, out_hz),
+        (2, 1) => audio_rechannel_2_1(&input, in_hz, out_hz),
+        (2, 3) => audio_rechannel_2_3(&input, in_hz, out_hz),
+        (2, 4) => audio_rechannel_2_4(&input, in_hz, out_hz),
+        (2, 5) => audio_rechannel_2_5(&input, in_hz, out_hz),
+        (2, 6) => audio_rechannel_2_6(&input, in_hz, out_hz),
+        (2, 7) => audio_rechannel_2_7(&input, in_hz, out_hz),
+        (2, 8) => audio_rechannel_2_8(&input, in_hz, out_hz),
+        (3, 1) => audio_rechannel_3_1(&input, in_hz, out_hz),
+        (3, 2) => audio_rechannel_3_2(&input, in_hz, out_hz),
+        (3, 4) => audio_rechannel_3_4(&input, in_hz, out_hz),
+        (3, 5) => audio_rechannel_3_5(&input, in_hz, out_hz),
+        (3, 6) => audio_rechannel_3_6(&input, in_hz, out_hz),
+        (3, 7) => audio_rechannel_3_7(&input, in_hz, out_hz),
+        (3, 8) => audio_rechannel_3_8(&input, in_hz, out_hz),
+        (4, 1) => audio_rechannel_4_1(&input, in_hz, out_hz),
+        (4, 2) => audio_rechannel_4_2(&input, in_hz, out_hz),
+        (4, 3) => audio_rechannel_4_3(&input, in_hz, out_hz),
+        (4, 5) => audio_rechannel_4_5(&input, in_hz, out_hz),
+        (4, 6) => audio_rechannel_4_6(&input, in_hz, out_hz),
+        (4, 7) => audio_rechannel_4_7(&input, in_hz, out_hz),
+        (4, 8) => audio_rechannel_4_8(&input, in_hz, out_hz),
+        (5, 1) => audio_rechannel_5_1(&input, in_hz, out_hz),
+        (5, 2) => audio_rechannel_5_2(&input, in_hz, out_hz),
+        (5, 3) => audio_rechannel_5_3(&input, in_hz, out_hz),
+        (5, 4) => audio_rechannel_5_4(&input, in_hz, out_hz),
+        (5, 6) => audio_rechannel_5_6(&input, in_hz, out_hz),
+        (5, 7) => audio_rechannel_5_7(&input, in_hz, out_hz),
+        (5, 8) => audio_rechannel_5_8(&input, in_hz, out_hz),
+        (6, 1) => audio_rechannel_6_1(&input, in_hz, out_hz),
+        (6, 2) => audio_rechannel_6_2(&input, in_hz, out_hz),
+        (6, 3) => audio_rechannel_6_3(&input, in_hz, out_hz),
+        (6, 4) => audio_rechannel_6_4(&input, in_hz, out_hz),
+        (6, 5) => audio_rechannel_6_5(&input, in_hz, out_hz),
+        (6, 7) => audio_rechannel_6_7(&input, in_hz, out_hz),
+        (6, 8) => audio_rechannel_6_8(&input, in_hz, out_hz),
+        (7, 1) => audio_rechannel_7_1(&input, in_hz, out_hz),
+        (7, 2) => audio_rechannel_7_2(&input, in_hz, out_hz),
+        (7, 3) => audio_rechannel_7_3(&input, in_hz, out_hz),
+        (7, 4) => audio_rechannel_7_4(&input, in_hz, out_hz),
+        (7, 5) => audio_rechannel_7_5(&input, in_hz, out_hz),
+        (7, 6) => audio_rechannel_7_6(&input, in_hz, out_hz),
+        (7, 8) => audio_rechannel_7_8(&input, in_hz, out_hz),
+        (8, 1) => audio_rechannel_8_1(&input, in_hz, out_hz),
+        (8, 2) => audio_rechannel_8_2(&input, in_hz, out_hz),
+        (8, 3) => audio_rechannel_8_3(&input, in_hz, out_hz),
+        (8, 4) => audio_rechannel_8_4(&input, in_hz, out_hz),
+        (8, 5) => audio_rechannel_8_5(&input, in_hz, out_hz),
+        (8, 6) => audio_rechannel_8_6(&input, in_hz, out_hz),
+        (8, 7) => audio_rechannel_8_7(&input, in_hz, out_hz),
+        _ => input,
+    }
+}
+
+macro_rules! audio_rechannel {
+    ($name:ident, $in_channels:expr, $out_channels:expr) => {
+        fn $name(input: &[f32], in_hz: u32, out_hz: u32) -> Vec<f32> {
+            use fon::{chan::Ch32, Audio, Frame};
+            let mut in_audio =
+                Audio::<Ch32, $in_channels>::with_silence(in_hz, input.len() / $in_channels);
+            for (x, y) in input.chunks_exact($in_channels).zip(in_audio.iter_mut()) {
+                let mut f = Frame::<Ch32, $in_channels>::default();
+                let mut i = 0;
+                for c in f.channels_mut() {
+                    *c = x[i].into();
+                    i += 1;
+                }
+                *y = f;
+            }
+            Audio::<Ch32, $out_channels>::with_audio(out_hz, &in_audio)
+                .as_f32_slice()
+                .to_owned()
+        }
+    };
+}
+
+audio_rechannel!(audio_rechannel_1_2, 1, 2);
+audio_rechannel!(audio_rechannel_1_3, 1, 3);
+audio_rechannel!(audio_rechannel_1_4, 1, 4);
+audio_rechannel!(audio_rechannel_1_5, 1, 5);
+audio_rechannel!(audio_rechannel_1_6, 1, 6);
+audio_rechannel!(audio_rechannel_1_7, 1, 7);
+audio_rechannel!(audio_rechannel_1_8, 1, 8);
+audio_rechannel!(audio_rechannel_2_1, 2, 1);
+audio_rechannel!(audio_rechannel_2_3, 2, 3);
+audio_rechannel!(audio_rechannel_2_4, 2, 4);
+audio_rechannel!(audio_rechannel_2_5, 2, 5);
+audio_rechannel!(audio_rechannel_2_6, 2, 6);
+audio_rechannel!(audio_rechannel_2_7, 2, 7);
+audio_rechannel!(audio_rechannel_2_8, 2, 8);
+audio_rechannel!(audio_rechannel_3_1, 3, 1);
+audio_rechannel!(audio_rechannel_3_2, 3, 2);
+audio_rechannel!(audio_rechannel_3_4, 3, 4);
+audio_rechannel!(audio_rechannel_3_5, 3, 5);
+audio_rechannel!(audio_rechannel_3_6, 3, 6);
+audio_rechannel!(audio_rechannel_3_7, 3, 7);
+audio_rechannel!(audio_rechannel_3_8, 3, 8);
+audio_rechannel!(audio_rechannel_4_1, 4, 1);
+audio_rechannel!(audio_rechannel_4_2, 4, 2);
+audio_rechannel!(audio_rechannel_4_3, 4, 3);
+audio_rechannel!(audio_rechannel_4_5, 4, 5);
+audio_rechannel!(audio_rechannel_4_6, 4, 6);
+audio_rechannel!(audio_rechannel_4_7, 4, 7);
+audio_rechannel!(audio_rechannel_4_8, 4, 8);
+audio_rechannel!(audio_rechannel_5_1, 5, 1);
+audio_rechannel!(audio_rechannel_5_2, 5, 2);
+audio_rechannel!(audio_rechannel_5_3, 5, 3);
+audio_rechannel!(audio_rechannel_5_4, 5, 4);
+audio_rechannel!(audio_rechannel_5_6, 5, 6);
+audio_rechannel!(audio_rechannel_5_7, 5, 7);
+audio_rechannel!(audio_rechannel_5_8, 5, 8);
+audio_rechannel!(audio_rechannel_6_1, 6, 1);
+audio_rechannel!(audio_rechannel_6_2, 6, 2);
+audio_rechannel!(audio_rechannel_6_3, 6, 3);
+audio_rechannel!(audio_rechannel_6_4, 6, 4);
+audio_rechannel!(audio_rechannel_6_5, 6, 5);
+audio_rechannel!(audio_rechannel_6_7, 6, 7);
+audio_rechannel!(audio_rechannel_6_8, 6, 8);
+audio_rechannel!(audio_rechannel_7_1, 7, 1);
+audio_rechannel!(audio_rechannel_7_2, 7, 2);
+audio_rechannel!(audio_rechannel_7_3, 7, 3);
+audio_rechannel!(audio_rechannel_7_4, 7, 4);
+audio_rechannel!(audio_rechannel_7_5, 7, 5);
+audio_rechannel!(audio_rechannel_7_6, 7, 6);
+audio_rechannel!(audio_rechannel_7_8, 7, 8);
+audio_rechannel!(audio_rechannel_8_1, 8, 1);
+audio_rechannel!(audio_rechannel_8_2, 8, 2);
+audio_rechannel!(audio_rechannel_8_3, 8, 3);
+audio_rechannel!(audio_rechannel_8_4, 8, 4);
+audio_rechannel!(audio_rechannel_8_5, 8, 5);
+audio_rechannel!(audio_rechannel_8_6, 8, 6);
+audio_rechannel!(audio_rechannel_8_7, 8, 7);
+
+pub async fn get_rendezvous_server(_ms_timeout: u64) -> (String, Vec<String>, bool) {
+    // netguard §二.1 (pure intranet): this build has no rendezvous server, and the old body still
+    // consulted the IPC service and the executable-name license, then turned a server list that
+    // contained an empty string into ":21116" via `check_port("", RENDEZVOUS_PORT)`. That fabricated
+    // address is exactly what made the address-book probe dial ":21115" at startup (seen in
+    // netguard-audit.log on 2026-10-27). The capability is removed at the supplier: every caller now
+    // gets ("", [], false) and can only fail closed. Do not restore the IPC/license branches.
+    (String::new(), Vec::new(), false)
+}
+
+#[inline]
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub async fn get_nat_type(_ms_timeout: u64) -> i32 {
+    Config::get_nat_type()
+}
+
+#[inline]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub async fn get_nat_type(ms_timeout: u64) -> i32 {
+    crate::ipc::get_nat_type(ms_timeout).await
+}
+
+// used for client to test which server is faster in case stop-servic=Y
+#[tokio::main(flavor = "current_thread")]
+async fn test_rendezvous_server_() {
+    // netguard §二.1: there is no server to measure. Returning before the loop keeps this function
+    // from ever constructing a dial target, even if a stale store somehow produced one.
+    return;
+}
+
+pub fn test_rendezvous_server() {
+    std::thread::spawn(test_rendezvous_server_);
+}
+
+pub fn refresh_rendezvous_server() {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    test_rendezvous_server();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    std::thread::spawn(|| {
+        if crate::ipc::test_rendezvous_server().is_err() {
+            test_rendezvous_server();
+        }
+    });
+}
+
+pub fn run_me<T: AsRef<std::ffi::OsStr>>(args: Vec<T>) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "linux")]
+    if let Ok(appdir) = std::env::var("APPDIR") {
+        let appimage_cmd = std::path::Path::new(&appdir).join("AppRun");
+        if appimage_cmd.exists() {
+            log::info!("path: {:?}", appimage_cmd);
+            return std::process::Command::new(appimage_cmd).args(&args).spawn();
+        }
+    }
+    let cmd = std::env::current_exe()?;
+    let mut cmd = std::process::Command::new(cmd);
+    #[cfg(windows)]
+    let mut force_foreground = false;
+    #[cfg(windows)]
+    {
+        let arg_strs = args
+            .iter()
+            .map(|x| x.as_ref().to_string_lossy())
+            .collect::<Vec<_>>();
+        if arg_strs == vec!["--install"] || arg_strs == &["--noinstall"] {
+            cmd.env(crate::platform::SET_FOREGROUND_WINDOW, "1");
+            force_foreground = true;
+        }
+    }
+    let result = cmd.args(&args).spawn();
+    match result.as_ref() {
+        Ok(_child) =>
+        {
+            #[cfg(windows)]
+            if force_foreground {
+                unsafe { winapi::um::winuser::AllowSetForegroundWindow(_child.id() as u32) };
+            }
+        }
+        Err(err) => log::error!("run_me: {err:?}"),
+    }
+    result
+}
+
+#[inline]
+pub fn username() -> String {
+    // fix bug of whoami
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    return whoami::username().trim_end_matches('\0').to_owned();
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    return DEVICE_NAME.lock().unwrap().clone();
+}
+
+// Exactly the implementation of "whoami::hostname()".
+// This wrapper is to suppress warnings.
+#[inline(always)]
+#[cfg(not(target_os = "ios"))]
+pub fn whoami_hostname() -> String {
+    let mut hostname = whoami::fallible::hostname().unwrap_or_else(|_| "localhost".to_string());
+    hostname.make_ascii_lowercase();
+    hostname
+}
+
+#[inline]
+pub fn hostname() -> String {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        #[allow(unused_mut)]
+        let mut name = whoami_hostname();
+        // some time, there is .local, some time not, so remove it for osx
+        #[cfg(target_os = "macos")]
+        if name.ends_with(".local") {
+            name = name.trim_end_matches(".local").to_owned();
+        }
+        name
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    return DEVICE_NAME.lock().unwrap().clone();
+}
+
+#[inline]
+pub fn get_sysinfo() -> serde_json::Value {
+    use hbb_common::sysinfo::System;
+    let mut system = System::new();
+    system.refresh_memory();
+    system.refresh_cpu();
+    let memory = system.total_memory();
+    let memory = (memory as f64 / 1024. / 1024. / 1024. * 100.).round() / 100.;
+    let cpus = system.cpus();
+    let cpu_name = cpus.first().map(|x| x.brand()).unwrap_or_default();
+    let cpu_name = cpu_name.trim_end();
+    let cpu_freq = cpus.first().map(|x| x.frequency()).unwrap_or_default();
+    let cpu_freq = (cpu_freq as f64 / 1024. * 100.).round() / 100.;
+    let cpu = if cpu_freq > 0. {
+        format!("{}, {}GHz, ", cpu_name, cpu_freq)
+    } else {
+        "".to_owned() // android
+    };
+    let num_cpus = num_cpus::get();
+    let num_pcpus = num_cpus::get_physical();
+    let mut os = system.distribution_id();
+    os = format!("{} / {}", os, system.long_os_version().unwrap_or_default());
+    #[cfg(windows)]
+    {
+        os = format!("{os} - {}", system.os_version().unwrap_or_default());
+    }
+    let hostname = hostname(); // sys.hostname() return localhost on android in my test
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let out;
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let mut out;
+    out = json!({
+        "cpu": format!("{cpu}{num_cpus}/{num_pcpus} cores"),
+        "memory": format!("{memory}GB"),
+        "os": os,
+        "hostname": hostname,
+    });
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        let username = crate::platform::get_active_username();
+        if !username.is_empty() && (!cfg!(windows) || username != "SYSTEM") {
+            out["username"] = json!(username);
+        }
+    }
+    out
+}
+
+#[inline]
+pub fn check_port<T: std::string::ToString>(host: T, port: i32) -> String {
+    hbb_common::socket_client::check_port(host, port)
+}
+
+#[inline]
+pub fn increase_port<T: std::string::ToString>(host: T, offset: i32) -> String {
+    hbb_common::socket_client::increase_port(host, offset)
+}
+
+pub const POSTFIX_SERVICE: &'static str = "_service";
+
+#[inline]
+pub fn is_control_key(evt: &KeyEvent, key: &ControlKey) -> bool {
+    if let Some(key_event::Union::ControlKey(ck)) = evt.union {
+        ck.value() == key.value()
+    } else {
+        false
+    }
+}
+
+#[inline]
+pub fn is_modifier(evt: &KeyEvent) -> bool {
+    if let Some(key_event::Union::ControlKey(ck)) = evt.union {
+        let v = ck.value();
+        v == ControlKey::Alt.value()
+            || v == ControlKey::Shift.value()
+            || v == ControlKey::Control.value()
+            || v == ControlKey::Meta.value()
+            || v == ControlKey::RAlt.value()
+            || v == ControlKey::RShift.value()
+            || v == ControlKey::RControl.value()
+            || v == ControlKey::RWin.value()
+    } else {
+        false
+    }
+}
+
+#[inline]
+pub fn get_app_name() -> String {
+    hbb_common::config::APP_NAME.read().unwrap().clone()
+}
+
+#[inline]
+pub fn is_rustdesk() -> bool {
+    hbb_common::config::APP_NAME.read().unwrap().eq("RustDesk")
+}
+
+#[inline]
+pub fn get_uri_prefix() -> String {
+    format!("{}://", get_app_name().to_lowercase())
+}
+
+#[cfg(target_os = "macos")]
+pub fn get_full_name() -> String {
+    format!(
+        "{}.{}",
+        hbb_common::config::ORG.read().unwrap(),
+        hbb_common::config::APP_NAME.read().unwrap(),
+    )
+}
+
+pub fn is_setup(name: &str) -> bool {
+    !config::is_disable_installation() && name.to_lowercase().ends_with("install.exe")
+}
+
+pub fn get_custom_rendezvous_server(custom: String) -> String {
+    // netguard 步 5 (需求 §二.5/§二.7): `custom` comes in from `get_option("custom-rendezvous-server")`,
+    // which the policy already pins to "", but this function's first branch reads the license **from the
+    // executable's file name** - a store no option table and no config file governs. Renaming the binary
+    // to `<app>-<host>.exe` used to be enough to put a server name back into every decision that asks
+    // "do we have a rendezvous server?" (`using_public_server`, `get_api_server_`), so the question is
+    // answered from the compiled policy here as well. See the same gate in
+    // `libs/hbb_common/src/config.rs::get_rendezvous_server`.
+    if hbb_common::netguard::is_forced_key("custom-rendezvous-server") {
+        return "".to_owned();
+    }
+    #[cfg(windows)]
+    if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
+        if !lic.host.is_empty() {
+            return lic.host.clone();
+        }
+    }
+    if !custom.is_empty() {
+        return custom;
+    }
+    if !config::PROD_RENDEZVOUS_SERVER.read().unwrap().is_empty() {
+        return config::PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+    }
+    "".to_owned()
+}
+
+#[inline]
+pub fn get_api_server(api: String, custom: String) -> String {
+    if Config::no_register_device() {
+        return "".to_owned();
+    }
+    let mut res = get_api_server_(api, custom);
+    if res.ends_with('/') {
+        res.pop();
+    }
+    if res.starts_with("https")
+        && res.ends_with(":21114")
+        && get_builtin_option(keys::OPTION_ALLOW_HTTPS_21114) != "Y"
+    {
+        return res.replace(":21114", "");
+    }
+    res
+}
+
+fn get_api_server_(api: String, custom: String) -> String {
+    #[cfg(windows)]
+    if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
+        if !lic.api.is_empty() {
+            return lic.api.clone();
+        }
+    }
+    if !api.is_empty() {
+        return api.to_owned();
+    }
+    let s0 = get_custom_rendezvous_server(custom);
+    if !s0.is_empty() {
+        let s = crate::increase_port(&s0, -2);
+        if s == s0 {
+            return format!("http://{}:{}", s, config::RENDEZVOUS_PORT - 2);
+        } else {
+            return format!("http://{}", s);
+        }
+    }
+    // netguard L1 (需求 §二.1): the official hosted API server was the fallback whenever no api
+    // server and no custom rendezvous were configured, so its name sat in every binary and a
+    // mis-set option produced real public egress. Empty means "there is no API server": the calls
+    // that use it (`hbbs_http::sync`, `record_upload`, OIDC login) now fail at the URL guard, and
+    // step 5 forces `register-device=N` so this fallback is never even reached.
+    String::new()
+}
+
+/// netguard L1 (需求 §二.1, 验收 §五): upstream asked "is this the vendor's hosted cloud?" by
+/// matching the host against the official domain, which left that domain as a string literal in
+/// every shipped binary. The same question has a sharper form in this build: the egress allow-list
+/// is two internal subnets and every name form is refused, so "the guard would let me dial this"
+/// already excludes the hosted cloud - and everything else outside the two subnets.
+///
+/// Call sites keep their fail-closed meaning: upstream wrote `if url.is_empty() || is_public(&url)
+/// { skip }`, and here the skip happens whenever the URL is *not* dial-able.
+#[inline]
+pub fn can_dial_url(url: &str) -> bool {
+    crate::hbbs_http::is_allowed_http_url(url, "common::can_dial_url")
+}
+
+pub fn get_tcp_punch_enabled() -> bool {
+    config::option2bool(
+        keys::OPTION_ENABLE_TCP_PUNCH,
+        &get_local_option(keys::OPTION_ENABLE_TCP_PUNCH),
+    )
+}
+
+pub fn get_udp_punch_enabled() -> bool {
+    config::option2bool(
+        keys::OPTION_ENABLE_UDP_PUNCH,
+        &get_local_option(keys::OPTION_ENABLE_UDP_PUNCH),
+    )
+}
+
+pub fn get_ipv6_punch_enabled() -> bool {
+    config::option2bool(
+        keys::OPTION_ENABLE_IPV6_PUNCH,
+        &get_local_option(keys::OPTION_ENABLE_IPV6_PUNCH),
+    )
+}
+
+pub fn get_webrtc_enabled() -> bool {
+    config::option2bool(
+        keys::OPTION_ENABLE_WEBRTC,
+        &get_local_option(keys::OPTION_ENABLE_WEBRTC),
+    )
+}
+
+pub fn get_local_option(key: &str) -> String {
+    let v = LocalConfig::get_option(key);
+    if key == keys::OPTION_ENABLE_UDP_PUNCH
+        || key == keys::OPTION_ENABLE_IPV6_PUNCH
+        || key == keys::OPTION_ENABLE_WEBRTC
+    {
+        // netguard L1: upstream returned "N" here only when the rendezvous server was *not* the
+        // hosted cloud, leaving the three NAT-traversal features default-on for a cloud account -
+        // the one case this build must not reproduce. With the hosted server removed, "no value
+        // configured" has a single safe reading: stay closed. Step 5 forces the options explicitly;
+        // this covers the window before any configuration exists.
+        if v.is_empty() {
+            return "N".to_owned();
+        }
+    }
+    if key == "lang" && (v == "pt" || v == "br") {
+        return "pt-br".to_owned();
+    }
+    v
+}
+
+pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
+    let url = get_api_server(api, custom);
+    if url.is_empty() || !can_dial_url(&url) {
+        return "".to_owned();
+    }
+    format!("{}/api/audit/{}", url, typ)
+}
+
+// netguard L3 (需求 §二.1/§二.5): the application-level HTTP stack that lived here is deleted
+// together with `src/hbbs_http`. It had three parts: a `reqwest` client, a "TCP proxy" protocol
+// that tunnelled requests through a remote proxy server over the rendezvous socket, and the
+// fallback logic between the two. Nothing of that is left.
+//
+// Every entry point is kept as a **refusal** so the UI, the CLI flag and the IPC arms that call
+// them keep compiling and get an explicit error instead of a silent no-op: no URL is parsed, no
+// client is built, no socket is opened. (`can_dial_url` still uses the URL *policy* function in
+// `hbbs_http`, which does no I/O.)
+fn http_removed(what: &str) -> hbb_common::anyhow::Error {
+    anyhow!(
+        "{} is removed from this build (netguard L3): no HTTP client is linked",
+        what
+    )
+}
+
+pub async fn post_request(url: String, _body: String, _header: &str) -> ResultType<String> {
+    Err(http_removed(&format!("post_request({})", url)))
+}
+
+#[tokio::main(flavor = "current_thread")]
+pub async fn post_request_sync(url: String, body: String, header: &str) -> ResultType<String> {
+    post_request(url, body, header).await
+}
+
+pub async fn post_request_with_status(
+    url: String,
+    _body: String,
+    _header: &str,
+) -> ResultType<(u16, String)> {
+    Err(http_removed(&format!("post_request_with_status({})", url)))
+}
+
+/// Raw request entry used by the Flutter bridge (`main_http_request` -> `ui_interface::http_request`).
+#[tokio::main(flavor = "current_thread")]
+pub async fn http_request_sync(
+    url: String,
+    _method: String,
+    _body: Option<String>,
+    _header: String,
+) -> ResultType<String> {
+    Err(http_removed(&format!("http_request_sync({})", url)))
+}
+
+#[inline]
+pub fn make_privacy_mode_msg_with_details(
+    state: back_notification::PrivacyModeState,
+    details: String,
+    impl_key: String,
+) -> Message {
+    let mut misc = Misc::new();
+    let mut back_notification = BackNotification {
+        details,
+        impl_key,
+        ..Default::default()
+    };
+    back_notification.set_privacy_mode_state(state);
+    misc.set_back_notification(back_notification);
+    let mut msg_out = Message::new();
+    msg_out.set_misc(misc);
+    msg_out
+}
+
+#[inline]
+pub fn make_privacy_mode_msg(
+    state: back_notification::PrivacyModeState,
+    impl_key: String,
+) -> Message {
+    make_privacy_mode_msg_with_details(state, "".to_owned(), impl_key)
+}
+
+pub fn is_keyboard_mode_supported(
+    keyboard_mode: &KeyboardMode,
+    version_number: i64,
+    peer_platform: &str,
+) -> bool {
+    match keyboard_mode {
+        KeyboardMode::Legacy => true,
+        KeyboardMode::Map => {
+            if peer_platform.to_lowercase() == crate::PLATFORM_ANDROID.to_lowercase() {
+                false
+            } else {
+                version_number >= hbb_common::get_version_number("1.2.0")
+            }
+        }
+        KeyboardMode::Translate => version_number >= hbb_common::get_version_number("1.2.0"),
+        KeyboardMode::Auto => version_number >= hbb_common::get_version_number("1.2.0"),
+    }
+}
+
+pub fn get_supported_keyboard_modes(version: i64, peer_platform: &str) -> Vec<KeyboardMode> {
+    KeyboardMode::iter()
+        .filter(|&mode| is_keyboard_mode_supported(mode, version, peer_platform))
+        .map(|&mode| mode)
+        .collect::<Vec<_>>()
+}
+
+pub fn make_fd_to_json(id: i32, path: String, entries: &Vec<FileEntry>) -> String {
+    let fd_json = _make_fd_to_json(id, path, entries);
+    serde_json::to_string(&fd_json).unwrap_or("".into())
+}
+
+pub fn _make_fd_to_json(id: i32, path: String, entries: &Vec<FileEntry>) -> Map<String, Value> {
+    let mut fd_json = serde_json::Map::new();
+    fd_json.insert("id".into(), json!(id));
+    fd_json.insert("path".into(), json!(path));
+
+    let mut entries_out = vec![];
+    for entry in entries {
+        let mut entry_map = serde_json::Map::new();
+        entry_map.insert("entry_type".into(), json!(entry.entry_type.value()));
+        entry_map.insert("name".into(), json!(entry.name));
+        entry_map.insert("size".into(), json!(entry.size));
+        entry_map.insert("modified_time".into(), json!(entry.modified_time));
+        entries_out.push(entry_map);
+    }
+    fd_json.insert("entries".into(), json!(entries_out));
+    fd_json
+}
+
+pub fn make_vec_fd_to_json(fds: &[FileDirectory]) -> String {
+    let mut fd_jsons = vec![];
+
+    for fd in fds.iter() {
+        let fd_json = _make_fd_to_json(fd.id, fd.path.clone(), &fd.entries);
+        fd_jsons.push(fd_json);
+    }
+
+    serde_json::to_string(&fd_jsons).unwrap_or("".into())
+}
+
+pub fn make_empty_dirs_response_to_json(res: &ReadEmptyDirsResponse) -> String {
+    let mut map: Map<String, Value> = serde_json::Map::new();
+    map.insert("path".into(), json!(res.path));
+
+    let mut fd_jsons = vec![];
+
+    for fd in res.empty_dirs.iter() {
+        let fd_json = _make_fd_to_json(fd.id, fd.path.clone(), &fd.entries);
+        fd_jsons.push(fd_json);
+    }
+    map.insert("empty_dirs".into(), fd_jsons.into());
+
+    serde_json::to_string(&map).unwrap_or("".into())
+}
+
+/// The function to handle the url scheme sent by the system.
+///
+/// 1. Try to send the url scheme from ipc.
+/// 2. If failed to send the url scheme, we open a new main window to handle this url scheme.
+pub fn handle_url_scheme(url: String) {
+    #[cfg(not(target_os = "ios"))]
+    if let Err(err) = crate::ipc::send_url_scheme(url.clone()) {
+        log::debug!("Send the url to the existing flutter process failed, {}. Let's open a new program to handle this.", err);
+        let _ = crate::run_me(vec![url]);
+    }
+}
+
+#[inline]
+pub fn encode64<T: AsRef<[u8]>>(input: T) -> String {
+    #[allow(deprecated)]
+    base64::encode(input)
+}
+
+#[inline]
+pub fn decode64<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, base64::DecodeError> {
+    #[allow(deprecated)]
+    base64::decode(input)
+}
+
+pub async fn get_key(sync: bool) -> String {
+    #[cfg(windows)]
+    if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
+        if !lic.key.is_empty() {
+            return lic.key;
+        }
+    }
+    #[cfg(target_os = "ios")]
+    let mut key = Config::get_option("key");
+    #[cfg(not(target_os = "ios"))]
+    let mut key = if sync {
+        Config::get_option("key")
+    } else {
+        let mut options = crate::ipc::get_options_async().await;
+        options.remove("key").unwrap_or_default()
+    };
+    if key.is_empty() {
+        key = config::RS_PUB_KEY.to_owned();
+    }
+    key
+}
+
+pub fn pk_to_fingerprint(pk: Vec<u8>) -> String {
+    let s: String = pk.iter().map(|u| format!("{:02x}", u)).collect();
+    s.chars()
+        .enumerate()
+        .map(|(i, c)| {
+            if i > 0 && i % 4 == 0 {
+                format!(" {}", c)
+            } else {
+                format!("{}", c)
+            }
+        })
+        .collect()
+}
+
+#[inline]
+pub async fn get_next_nonkeyexchange_msg(
+    conn: &mut Stream,
+    timeout: Option<u64>,
+) -> Option<RendezvousMessage> {
+    let timeout = timeout.unwrap_or(READ_TIMEOUT);
+    for _ in 0..2 {
+        if let Some(Ok(bytes)) = conn.next_timeout(timeout).await {
+            if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+                match &msg_in.union {
+                    Some(rendezvous_message::Union::KeyExchange(_)) => {
+                        continue;
+                    }
+                    _ => {
+                        return Some(msg_in);
+                    }
+                }
+            }
+        }
+        break;
+    }
+    None
+}
+
+#[cfg(all(target_os = "windows", not(target_pointer_width = "64")))]
+pub fn check_process(arg: &str, same_session_id: bool) -> bool {
+    let mut path = std::env::current_exe().unwrap_or_default();
+    if let Ok(linked) = path.read_link() {
+        path = linked;
+    }
+    let Some(filename) = path.file_name() else {
+        return false;
+    };
+    let filename = filename.to_string_lossy().to_string();
+    match crate::platform::windows::get_pids_with_first_arg_check_session(
+        &filename,
+        arg,
+        same_session_id,
+    ) {
+        Ok(pids) => {
+            let self_pid = hbb_common::sysinfo::Pid::from_u32(std::process::id());
+            pids.into_iter().filter(|pid| *pid != self_pid).count() > 0
+        }
+        Err(e) => {
+            log::error!("Failed to check process with arg: \"{}\", {}", arg, e);
+            false
+        }
+    }
+}
+
+#[allow(unused_mut)]
+#[cfg(not(all(target_os = "windows", not(target_pointer_width = "64"))))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    if !crate::platform::is_root() && !same_uid {
+        log::warn!("Can not get other process's command line arguments on macos without root");
+        same_uid = true;
+    }
+    use hbb_common::sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_processes();
+    let mut path = std::env::current_exe().unwrap_or_default();
+    if let Ok(linked) = path.read_link() {
+        path = linked;
+    }
+    let path = path.to_string_lossy().to_lowercase();
+    let my_uid = sys
+        .process((std::process::id() as usize).into())
+        .map(|x| x.user_id())
+        .unwrap_or_default();
+    for (_, p) in sys.processes().iter() {
+        let mut cur_path = p.exe().to_path_buf();
+        if let Ok(linked) = cur_path.read_link() {
+            cur_path = linked;
+        }
+        if cur_path.to_string_lossy().to_lowercase() != path {
+            continue;
+        }
+        if p.pid().to_string() == std::process::id().to_string() {
+            continue;
+        }
+        if same_uid && p.user_id() != my_uid {
+            continue;
+        }
+        // on mac, p.cmd() get "/Applications/RustDesk.app/Contents/MacOS/RustDesk", "XPC_SERVICE_NAME=com.carriez.RustDesk_server"
+        let parg = if p.cmd().len() <= 1 { "" } else { &p.cmd()[1] };
+        if arg.is_empty() {
+            if !parg.starts_with("--") {
+                return true;
+            }
+        } else if arg == parg {
+            return true;
+        }
+    }
+    false
+}
+
+async fn secure_tcp_impl(conn: &mut Stream, key: &str, log_on_success: bool) -> ResultType<()> {
+    // Skip additional encryption when using WebSocket connections (wss://)
+    // as WebSocket Secure (wss://) already provides transport layer encryption.
+    // This doesn't affect the end-to-end encryption between clients,
+    // it only avoids redundant encryption between client and server.
+    if use_ws() {
+        return Ok(());
+    }
+    key_exchange(conn, key, log_on_success).await.map(|_| ())
+}
+
+/// The server's key exchange on `conn`. `Ok(true)` once the stream is encrypted. `Ok(false)`
+/// when the server sent something else first, nothing parseable, or closed: `secure_tcp`
+/// tolerates that for servers from before the exchange, `secure_tcp_required` does not.
+async fn key_exchange(conn: &mut Stream, key: &str, log_on_success: bool) -> ResultType<bool> {
+    let rs_pk = get_rs_pk(key);
+    let Some(rs_pk) = rs_pk else {
+        bail!("Handshake failed: invalid public key from rendezvous server");
+    };
+    match timeout(READ_TIMEOUT, conn.next()).await? {
+        Some(Ok(bytes)) => {
+            if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+                match msg_in.union {
+                    Some(rendezvous_message::Union::KeyExchange(ex)) => {
+                        if ex.keys.len() != 1 {
+                            bail!("Handshake failed: invalid key exchange message");
+                        }
+                        let their_pk_b = sign::verify(&ex.keys[0], &rs_pk)
+                            .map_err(|_| anyhow!("Signature mismatch in key exchange"))?;
+                        let their_pk_b = get_pk(&their_pk_b)
+                            .context("Wrong their public length in key exchange")?;
+                        // The signed X25519 high bit marks servers that sign their parameters.
+                        // X25519 ignores that bit, so old clients use the key unchanged; keep
+                        // the bytes as signed, since the transcript and KxParams carry them so.
+                        if their_pk_b[31] & 0x80 != 0 || !ex.signed_params.is_empty() {
+                            let params = sign::verify(&ex.signed_params, &rs_pk)
+                                .ok()
+                                .and_then(|signed| {
+                                    let params =
+                                        signed.strip_prefix(hbb_common::tcp::KX_PARAMS_DOMAIN)?;
+                                    KxParams::parse_from_bytes(params).ok()
+                                })
+                                .ok_or_else(|| {
+                                    anyhow!("Missing or invalid signed key exchange parameters")
+                                })?;
+                            if params.pk[..] != their_pk_b[..] || params.version != ex.version {
+                                bail!("Key exchange version or public key does not match its signature");
+                            }
+                        }
+                        let (asymmetric_value, symmetric_value, key) =
+                            create_symmetric_key_msg(their_pk_b);
+                        let picked = hbb_common::tcp::kx_version_for(ex.version);
+                        let mut msg_out = RendezvousMessage::new();
+                        msg_out.set_key_exchange(KeyExchange {
+                            keys: vec![asymmetric_value.clone(), symmetric_value],
+                            version: picked,
+                            ..Default::default()
+                        });
+                        timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
+                        conn.set_negotiated_key(
+                            key,
+                            true,
+                            &hbb_common::tcp::KxTranscript {
+                                initiator_pk: &asymmetric_value,
+                                responder_pk: &their_pk_b,
+                                advertised: ex.version,
+                                picked,
+                            },
+                        )?;
+                        if log_on_success {
+                            log::info!("Connection secured");
+                        }
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+pub async fn secure_tcp(conn: &mut Stream, key: &str) -> ResultType<()> {
+    secure_tcp_impl(conn, key, true).await
+}
+
+async fn secure_tcp_silent(conn: &mut Stream, key: &str) -> ResultType<()> {
+    secure_tcp_impl(conn, key, false).await
+}
+
+/// Like [`secure_tcp`], but returns only once the server's key exchange has actually encrypted
+/// the stream; a server that answers with anything else, or with nothing, is an error, so the
+/// caller can withhold what it was about to send instead of sending it in the clear.
+/// `secure_tcp` keeps tolerating such a server, which the paths from before the exchange depend
+/// on. WebSocket is treated as `secure_tcp` treats it, as a transport that is encrypted already.
+pub async fn secure_tcp_required(conn: &mut Stream, key: &str) -> ResultType<()> {
+    if use_ws() {
+        return Ok(());
+    }
+    if key_exchange(conn, key, true).await? {
+        Ok(())
+    } else {
+        bail!("the rendezvous server did not complete the key exchange");
+    }
+}
+
+#[inline]
+fn get_pk(pk: &[u8]) -> Option<[u8; 32]> {
+    if pk.len() == 32 {
+        let mut tmp = [0u8; 32];
+        tmp[..].copy_from_slice(&pk);
+        Some(tmp)
+    } else {
+        None
+    }
+}
+
+#[inline]
+pub fn get_rs_pk(str_base64: &str) -> Option<sign::PublicKey> {
+    if let Ok(pk) = crate::decode64(str_base64) {
+        get_pk(&pk).map(|x| sign::PublicKey(x))
+    } else {
+        None
+    }
+}
+
+pub fn decode_id_pk(signed: &[u8], key: &sign::PublicKey) -> ResultType<(String, [u8; 32])> {
+    let (id, pk, _, _) = decode_id_pk_dtls(signed, key)?;
+    Ok((id, pk))
+}
+
+/// Like [`decode_id_pk`] but also returns the signed DTLS certificate fingerprint (empty string
+/// for non-WebRTC peers), used to bind a WebRTC DTLS channel to the verified peer identity, and
+/// the newest key exchange version the peer speaks (0, the original scheme, for a peer from
+/// before versions).
+pub fn decode_id_pk_dtls(
+    signed: &[u8],
+    key: &sign::PublicKey,
+) -> ResultType<(String, [u8; 32], String, u32)> {
+    let res = IdPk::parse_from_bytes(
+        &sign::verify(signed, key).map_err(|_| anyhow!("Signature mismatch"))?,
+    )?;
+    if let Some(pk) = get_pk(&res.pk) {
+        Ok((res.id, pk, res.dtls_fingerprint, res.kx_version))
+    } else {
+        bail!("Wrong their public length");
+    }
+}
+
+/// Whether the DTLS fingerprint a WebRTC peer signed into its identity is the one of the channel
+/// actually negotiated. An empty signed value binds nothing: on a WebRTC channel it is either a
+/// peer that could not sign one or a rendezvous/relay that stripped it, and both fail closed.
+pub fn dtls_fingerprint_bound(signed_fp: &str, actual_fp: &str) -> bool {
+    !signed_fp.is_empty() && signed_fp == actual_fp
+}
+
+pub fn create_symmetric_key_msg(their_pk_b: [u8; 32]) -> (Bytes, Bytes, secretbox::Key) {
+    let their_pk_b = box_::PublicKey(their_pk_b);
+    let (our_pk_b, out_sk_b) = box_::gen_keypair();
+    let key = secretbox::gen_key();
+    let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+    let sealed_key = box_::seal(&key.0, &nonce, &their_pk_b, &out_sk_b);
+    (Vec::from(our_pk_b.0).into(), sealed_key.into(), key)
+}
+
+#[inline]
+pub fn using_public_server() -> bool {
+    crate::get_custom_rendezvous_server(get_option("custom-rendezvous-server")).is_empty()
+}
+
+pub struct ThrottledInterval {
+    interval: Interval,
+    next_tick: Instant,
+    min_interval: Duration,
+}
+
+impl ThrottledInterval {
+    pub fn new(i: Interval) -> ThrottledInterval {
+        let period = i.period();
+        ThrottledInterval {
+            interval: i,
+            next_tick: Instant::now(),
+            min_interval: Duration::from_secs_f64(period.as_secs_f64() * 0.9),
+        }
+    }
+
+    pub async fn tick(&mut self) -> Instant {
+        let instant = poll_fn(|cx| self.poll_tick(cx));
+        instant.await
+    }
+
+    pub fn poll_tick(&mut self, cx: &mut std::task::Context<'_>) -> Poll<Instant> {
+        match self.interval.poll_tick(cx) {
+            Poll::Ready(instant) => {
+                let now = Instant::now();
+                if self.next_tick <= now {
+                    self.next_tick = now + self.min_interval;
+                    Poll::Ready(instant)
+                } else {
+                    // This call is required since tokio 1.27
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub type RustDeskInterval = ThrottledInterval;
+
+#[inline]
+pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
+    ThrottledInterval::new(i)
+}
+
+pub fn load_custom_client() {
+    #[cfg(debug_assertions)]
+    if let Ok(data) = std::fs::read_to_string("./custom.txt") {
+        read_custom_client(data.trim());
+        return;
+    }
+    let Some(path) = std::env::current_exe().map_or(None, |x| x.parent().map(|x| x.to_path_buf()))
+    else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    let path = path.join("../Resources");
+    let path = path.join("custom.txt");
+    if path.is_file() {
+        let Ok(data) = std::fs::read_to_string(&path) else {
+            log::error!("Failed to read custom client config");
+            return;
+        };
+        read_custom_client(&data.trim());
+    }
+}
+
+fn read_custom_client_advanced_settings(
+    settings: serde_json::Value,
+    map_display_settings: &HashMap<String, &&str>,
+    map_local_settings: &HashMap<String, &&str>,
+    map_settings: &HashMap<String, &&str>,
+    map_buildin_settings: &HashMap<String, &&str>,
+    is_override: bool,
+) {
+    let mut display_settings = if is_override {
+        config::OVERWRITE_DISPLAY_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_DISPLAY_SETTINGS.write().unwrap()
+    };
+    let mut local_settings = if is_override {
+        config::OVERWRITE_LOCAL_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_LOCAL_SETTINGS.write().unwrap()
+    };
+    let mut server_settings = if is_override {
+        config::OVERWRITE_SETTINGS.write().unwrap()
+    } else {
+        config::DEFAULT_SETTINGS.write().unwrap()
+    };
+    let mut buildin_settings = config::BUILTIN_SETTINGS.write().unwrap();
+
+    if let Some(settings) = settings.as_object() {
+        for (k, v) in settings {
+            let Some(v) = v.as_str() else {
+                continue;
+            };
+            if let Some(k2) = map_display_settings.get(k) {
+                display_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_local_settings.get(k) {
+                local_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_settings.get(k) {
+                server_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_buildin_settings.get(k) {
+                buildin_settings.insert(k2.to_string(), v.to_owned());
+            } else {
+                let k2 = k.replace("_", "-");
+                let k = k2.replace("-", "_");
+                // display
+                display_settings.insert(k.clone(), v.to_owned());
+                display_settings.insert(k2.clone(), v.to_owned());
+                // local
+                local_settings.insert(k.clone(), v.to_owned());
+                local_settings.insert(k2.clone(), v.to_owned());
+                // server
+                server_settings.insert(k.clone(), v.to_owned());
+                server_settings.insert(k2.clone(), v.to_owned());
+                // buildin
+                buildin_settings.insert(k.clone(), v.to_owned());
+                buildin_settings.insert(k2.clone(), v.to_owned());
+            }
+        }
+    }
+}
+
+#[inline]
+#[cfg(target_os = "macos")]
+pub fn get_dst_align_rgba() -> usize {
+    // https://developer.apple.com/forums/thread/712709
+    // Memory alignment should be multiple of 64.
+    if crate::ui_interface::use_texture_render() {
+        64
+    } else {
+        1
+    }
+}
+
+#[inline]
+#[cfg(not(target_os = "macos"))]
+pub fn get_dst_align_rgba() -> usize {
+    1
+}
+
+pub fn read_custom_client(config: &str) {
+    let Ok(data) = decode64(config) else {
+        log::error!("Failed to decode custom client config");
+        return;
+    };
+    const KEY: &str = "5Qbwsde3unUcJBtrx9ZkvUmwFNoExHzpryHuPUdqlWM=";
+    let Some(pk) = get_rs_pk(KEY) else {
+        log::error!("Failed to parse public key of custom client");
+        return;
+    };
+    let Ok(data) = sign::verify(&data, &pk) else {
+        log::error!("Failed to dec custom client config");
+        return;
+    };
+    let Ok(mut data) =
+        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&data)
+    else {
+        log::error!("Failed to parse custom client config");
+        return;
+    };
+
+    if let Some(app_name) = data.remove("app-name") {
+        if let Some(app_name) = app_name.as_str() {
+            *config::APP_NAME.write().unwrap() = app_name.to_owned();
+        }
+    }
+
+    let mut map_display_settings = HashMap::new();
+    for s in keys::KEYS_DISPLAY_SETTINGS {
+        map_display_settings.insert(s.replace("_", "-"), s);
+    }
+    let mut map_local_settings = HashMap::new();
+    for s in keys::KEYS_LOCAL_SETTINGS {
+        map_local_settings.insert(s.replace("_", "-"), s);
+    }
+    let mut map_settings = HashMap::new();
+    for s in keys::KEYS_SETTINGS {
+        map_settings.insert(s.replace("_", "-"), s);
+    }
+    let mut buildin_settings = HashMap::new();
+    for s in keys::KEYS_BUILDIN_SETTINGS {
+        buildin_settings.insert(s.replace("_", "-"), s);
+    }
+    if let Some(default_settings) = data.remove("default-settings") {
+        read_custom_client_advanced_settings(
+            default_settings,
+            &map_display_settings,
+            &map_local_settings,
+            &map_settings,
+            &buildin_settings,
+            false,
+        );
+    }
+    if let Some(overwrite_settings) = data.remove("override-settings") {
+        read_custom_client_advanced_settings(
+            overwrite_settings,
+            &map_display_settings,
+            &map_local_settings,
+            &map_settings,
+            &buildin_settings,
+            true,
+        );
+    }
+    for (k, v) in data {
+        if let Some(v) = v.as_str() {
+            config::HARD_SETTINGS
+                .write()
+                .unwrap()
+                .insert(k, v.to_owned());
+        };
+    }
+}
+
+#[inline]
+pub fn is_empty_uni_link(arg: &str) -> bool {
+    let prefix = crate::get_uri_prefix();
+    if !arg.starts_with(&prefix) {
+        return false;
+    }
+    arg[prefix.len()..].chars().all(|c| c == '/')
+}
+
+pub fn get_hwid() -> Bytes {
+    use hbb_common::sha2::{Digest, Sha256};
+
+    let uuid = hbb_common::get_uuid();
+    let mut hasher = Sha256::new();
+    hasher.update(&uuid);
+    Bytes::from(hasher.finalize().to_vec())
+}
+
+#[inline]
+pub fn get_builtin_option(key: &str) -> String {
+    // netguard 步 5 (需求 §二.7): `custom.txt` is signature-checked (`common.rs::load_custom_client`),
+    // so this is not an attacker-facing store - but it is still a *file* that can carry one of the
+    // pinned keys, and `flutter_ffi.rs:2630/3044` hands this getter to Dart for an arbitrary key. The
+    // compiled policy answers first here, exactly like `config::get_or` does for the editable stores,
+    // so there is no reader left that a pinned option can slip through.
+    if let Some(v) = hbb_common::netguard::force_option(key) {
+        return v;
+    }
+    config::BUILTIN_SETTINGS
+        .read()
+        .unwrap()
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[inline]
+pub fn is_custom_client() -> bool {
+    get_app_name() != "RustDesk"
+}
+
+pub fn verify_login(_raw: &str, _id: &str) -> bool {
+    true
+    /*
+    if is_custom_client() {
+        return true;
+    }
+    #[cfg(debug_assertions)]
+    return true;
+    let Ok(pk) = crate::decode64("IycjQd4TmWvjjLnYd796Rd+XkK+KG+7GU1Ia7u4+vSw=") else {
+        return false;
+    };
+    let Some(key) = get_pk(&pk).map(|x| sign::PublicKey(x)) else {
+        return false;
+    };
+    let Ok(v) = crate::decode64(raw) else {
+        return false;
+    };
+    let raw = sign::verify(&v, &key).unwrap_or_default();
+    let v_str = std::str::from_utf8(&raw)
+        .unwrap_or_default()
+        .split(":")
+        .next()
+        .unwrap_or_default();
+    v_str == id
+    */
+}
+
+#[inline]
+pub fn is_udp_disabled() -> bool {
+    Config::get_option(keys::OPTION_DISABLE_UDP) == "Y"
+}
+
+/// Run KCP with its congestion window (nc=0) instead of the turbo profile it has always shipped.
+///
+/// Opt-in: which profile wins depends on why packets are lost — nc=1 deepens real congestion,
+/// while nc=0 reads random loss as congestion and its RTO backoff drops cwnd to 1. Undecidable
+/// without a shaped link, so keep what users run today.
+#[inline]
+pub fn get_kcp_cc_enabled() -> bool {
+    let k = keys::OPTION_ALLOW_KCP_CC;
+    config::option2bool(k, &Config::get_option(k))
+}
+
+// A punch packet carries a magic and a transaction id so a reply can be *proven* to answer this
+// probe. The punch it replaces sent a zero-length datagram and called the hole open on whatever
+// arrived next - which the rendezvous NAT test's own leftover replies satisfied instantly, so the
+// retry loop below never actually ran and its success meant nothing.
+const PUNCH_PROBE: [u8; 4] = *b"RDP?";
+const PUNCH_ACK: [u8; 4] = *b"RDP!";
+const PUNCH_PACKET_LEN: usize = 12;
+
+fn punch_packet(tag: &[u8; 4], tid: u64) -> [u8; PUNCH_PACKET_LEN] {
+    let mut packet = [0u8; PUNCH_PACKET_LEN];
+    packet[..4].copy_from_slice(tag);
+    packet[4..].copy_from_slice(&tid.to_le_bytes());
+    packet
+}
+
+fn punch_tid(packet: &[u8], tag: &[u8; 4]) -> Option<u64> {
+    if packet.len() != PUNCH_PACKET_LEN || packet[..4] != tag[..] {
+        return None;
+    }
+    packet[4..].try_into().ok().map(u64::from_le_bytes)
+}
+
+/// Punch until one of our own probes is acknowledged. Both ends run this identically - each
+/// probes, each answers the other's probes - and each returns only once a reply carrying its own
+/// transaction id comes back, the one thing that proves the pair carries traffic both ways.
+///
+/// Returning is therefore a fact rather than a guess, which is what lets the caller stop instead
+/// of handing a dead socket to a transport whose only way to discover the truth is to time out.
+///
+/// A datagram that is neither probe nor acknowledgement is returned rather than dropped: it means
+/// the peer finished first and is already speaking KCP, whose SYN is never retransmitted.
+///
+/// Only the connector stops on its own acknowledgement, because only it has something to send
+/// next. An acknowledgement proves our probe came back, not that the peer's probe was answered -
+/// and after this returns nothing answers probes any more, since KCP's io loop drops anything
+/// shorter than its header. A listener that stopped here would go mute while a peer whose own
+/// probe or answer was lost - the normal state of a hole that is still opening - kept probing an
+/// endpoint that works, until it timed out. So the listener stops on the peer's first real packet.
+pub async fn punch_udp(
+    socket: Arc<UdpSocket>,
+    listen: bool,
+) -> ResultType<Option<bytes::BytesMut>> {
+    let tid = ((hbb_common::time_based_rand() as u64) << 32) | hbb_common::time_based_rand() as u64;
+    let probe = punch_packet(&PUNCH_PROBE, tid);
+    let mut data = [0u8; 1500];
+    // `connect` does not flush the receive queue, so the NAT test's extra replies are still in it.
+    while socket.try_recv(&mut data).is_ok() {}
+
+    let mut retry_interval = Duration::from_millis(20);
+    const MAX_INTERVAL: Duration = Duration::from_millis(200);
+    // Both ends start within one rendezvous round trip of each other and the acknowledgement is
+    // one peer round trip, so a pair that has not answered in this long is not going to. The old
+    // 20s came from having no way to tell "not yet" from "never".
+    const MAX_TIME: Duration = Duration::from_secs(3);
+    let mut probes_sent = 0u32;
+    let mut probes_seen = 0u32;
+    let mut acked = false;
+    let mut recv_errors = 0u32;
+    socket.send(&probe).await.ok();
+    probes_sent += 1;
+    let tm = Instant::now();
+    // Absolute instants, not relative sleeps: `select!` rebuilds every arm each iteration, so a
+    // peer that keeps the receive side ready restarts a relative timer before it can fire. That
+    // both defeats MAX_TIME and starves the retransmit, and the peer decides the rate - an
+    // old-build peer's empty datagrams match no arm below and loop without even a pause.
+    let deadline = tm + MAX_TIME;
+    let mut next_probe = tm + retry_interval;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                bail!("UDP punch is timed out, {probes_sent} probes sent, {probes_seen} probes received, acked: {acked}, {recv_errors} recv errors absorbed");
+            }
+            _ = tokio::time::sleep_until(next_probe) => {
+                socket.send(&probe).await.ok();
+                probes_sent += 1;
+                retry_interval = std::cmp::min(retry_interval.mul_f64(1.5), MAX_INTERVAL);
+                next_probe = Instant::now() + retry_interval;
+            }
+            res = socket.recv(&mut data) => match res {
+                Err(e) => {
+                    // ICMP unreachable from the peer's NAT is expected while the hole forms and
+                    // surfaces here as ConnectionReset/Refused; treat it as loss, MAX_TIME bounds
+                    // the attempt. Log only the first - this retries every 10ms.
+                    recv_errors += 1;
+                    if recv_errors == 1 {
+                        log::debug!("UDP punch recv error (treated as loss): {e}");
+                    }
+                    hbb_common::sleep(0.01).await;
+                }
+                Ok(n) => {
+                    let ack = punch_tid(&data[..n], &PUNCH_ACK);
+                    if ack == Some(tid) {
+                        if !listen {
+                            log::debug!(
+                                "UDP punch confirmed in {:?}, {probes_sent} probes sent, {probes_seen} received",
+                                tm.elapsed()
+                            );
+                            return Ok(None);
+                        }
+                        acked = true;
+                    } else if let Some(peer_tid) = punch_tid(&data[..n], &PUNCH_PROBE) {
+                        probes_seen += 1;
+                        socket.send(&punch_packet(&PUNCH_ACK, peer_tid)).await.ok();
+                    } else if ack.is_none() && n > 0 {
+                        log::debug!(
+                            "UDP punch confirmed by {n} bytes of peer data in {:?}, {probes_sent} probes sent",
+                            tm.elapsed()
+                        );
+                        return Ok(Some(bytes::BytesMut::from(&data[..n])));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// L12: the only things ever put an address in here were the STUN query (`stun_ipv6_test`) and the
+/// kernel route probe (`test_bind_ipv6`), and both are deleted - the egress allow-list is IPv4-only,
+/// so neither could have succeeded in this build anyway, they only produced a public attempt and a
+/// refusal. There is now no IPv6 source address to bind, so this answers `None`. The mediator's
+/// half of the v6 punch chain (`start_ipv6`, `udp_nat_listen`) is deleted in 步 6-G; the remaining
+/// consumer in `client.rs` (`socket_addr_v6`) is inert because of this `None` - it is kept only
+/// because removing it means changing `_start_inner`'s signature and the punch request fields,
+/// which needs a compiler. Nothing here can put a v6 address on the wire.
+pub async fn get_ipv6_socket() -> Option<(Arc<UdpSocket>, bytes::Bytes)> {
+    None
+}
+
+// The color is the same to `str2color()` in flutter.
+pub fn str2color(s: &str, alpha: u8) -> u32 {
+    let bytes = s.as_bytes();
+    // dart code `160 << 16 + 114 << 8 + 91` results `0`.
+    let mut hash: u32 = 0;
+    for &byte in bytes {
+        let code = byte as u32;
+        hash = code.wrapping_add((hash << 5).wrapping_sub(hash));
+    }
+
+    hash = hash % 16777216;
+    let rgb = hash & 0xFF7FFF;
+
+    (alpha as u32) << 24 | rgb
+}
+
+/// Check control permission state from a u64 bitmap.
+/// Each permission uses 2 bits: 0 = not set, 1 = disable, 2 = enable, 3 = invalid (treated as not set)
+/// Returns: Some(true) = enabled, Some(false) = disabled, None = not set or invalid
+pub fn get_control_permission(
+    permissions: u64,
+    permission: hbb_common::rendezvous_proto::control_permissions::Permission,
+) -> Option<bool> {
+    use hbb_common::protobuf::Enum;
+    let index = permission.value();
+    if index >= 0 && index < 32 {
+        let shift = index * 2;
+        let value = (permissions >> shift) & 0b11;
+        match value {
+            1 => Some(false), // disable
+            2 => Some(true),  // enable
+            _ => None,        // 0 = not set, 3 = invalid
+        }
+    } else {
+        None
+    }
+}
+
+pub fn is_direct_ip_access(peer: &str) -> bool {
+    hbb_common::is_ip_str(peer) || hbb_common::is_domain_port_str(peer)
+}
+
+// Align the maximum length of the peer id to the maximum length of the peer id in the server.
+const MAX_UNTRUSTED_PEER_ID_LEN: usize = 253;
+const UNTRUSTED_PEER_ID_FORBIDDEN_CHARS: &[char] = &['"', '<', '>', '/', '\\', '|', '?', '*'];
+
+// Shared validation for peer/connect ids that cross untrusted boundaries before
+// they are stored or written into command/script contexts.
+pub fn is_valid_untrusted_peer_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_UNTRUSTED_PEER_ID_LEN
+        && !id.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || UNTRUSTED_PEER_ID_FORBIDDEN_CHARS.contains(&ch)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hbb_common::tokio::{
+        self,
+        time::{interval, interval_at, sleep, Duration, Instant, Interval},
+    };
+    use std::collections::HashSet;
+
+    #[test]
+    fn a_cursor_content_id_fits_a_web_client_number() {
+        const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+        for colors in [&b"arrow"[..], b"beam", b"hand", b""] {
+            for hotx in 0..64 {
+                assert!(cursor_content_id(32, 32, hotx, 0, colors) <= MAX_SAFE_INTEGER);
+            }
+        }
+    }
+
+    #[inline]
+    fn get_timestamp_secs() -> u128 {
+        (std::time::SystemTime::UNIX_EPOCH
+            .elapsed()
+            .unwrap()
+            .as_millis()
+            + 500)
+            / 1000
+    }
+
+    fn interval_maker() -> Interval {
+        interval(Duration::from_secs(1))
+    }
+
+    fn interval_at_maker() -> Interval {
+        interval_at(
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+    }
+
+    // The deadline must hold against a peer that keeps the receive side ready. `select!` rebuilds
+    // its arms every iteration, so a relative sleep would be restarted by every datagram and the
+    // punch would run for as long as the peer keeps talking, with no outer timeout to stop it.
+    #[tokio::test]
+    async fn test_udp_punch_deadline_survives_a_talkative_peer() {
+        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (a_addr, b_addr) = (a.local_addr().unwrap(), b.local_addr().unwrap());
+        a.connect(b_addr).await.unwrap();
+        b.connect(a_addr).await.unwrap();
+        // Empty datagrams answer no probe and match no return branch, so they only feed the loop.
+        // Sent well past the punch deadline so a restarted timer would show up as a long run.
+        let flooder = tokio::spawn(async move {
+            let end = Instant::now() + Duration::from_secs(12);
+            while Instant::now() < end {
+                if b.send(&[]).await.is_err() {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let start = Instant::now();
+        let res = punch_udp(Arc::new(a), false).await;
+        let elapsed = start.elapsed();
+        flooder.abort();
+        assert!(res.is_err(), "the punch should have timed out");
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "the punch ran for {elapsed:?}; its deadline did not hold"
+        );
+    }
+
+    #[test]
+    fn untrusted_peer_id_validation() {
+        let cases = [
+            ("123456789", true),
+            ("m\u{00FC}nchen-pc", true),
+            ("192.168.1.10:21118", true),
+            ("9123456234@public", true),
+            (
+                r#"1" & oWS.Run("cmd.exe /k whoami /priv",1,False) & ""#,
+                false,
+            ),
+            ("", false),
+            ("peer id", false),
+            ("peer\nid", false),
+            ("peer/id", false),
+            ("peer?id", false),
+        ];
+
+        for (id, expected) in cases {
+            assert_eq!(is_valid_untrusted_peer_id(id), expected, "{id:?}");
+        }
+    }
+
+    // ThrottledInterval tick at the same time as tokio interval, if no sleeps
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn test_RustDesk_interval() {
+        let base_intervals = [interval_maker, interval_at_maker];
+        for maker in base_intervals.into_iter() {
+            let mut tokio_timer = maker();
+            let mut tokio_times = Vec::new();
+            let mut timer = rustdesk_interval(maker());
+            let mut times = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        if tokio_times.len() >= 10 && times.len() >= 10 {
+                            break;
+                        }
+                        times.push(get_timestamp_secs());
+                    }
+                    _ = tokio_timer.tick() => {
+                        if tokio_times.len() >= 10 && times.len() >= 10 {
+                            break;
+                        }
+                        tokio_times.push(get_timestamp_secs());
+                    }
+                }
+            }
+            assert_eq!(times, tokio_times);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tokio_time_interval_sleep() {
+        let mut timer = interval_maker();
+        let mut times = Vec::new();
+        sleep(Duration::from_secs(3)).await;
+        loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    times.push(get_timestamp_secs());
+                    if times.len() == 5 {
+                        break;
+                    }
+                }
+            }
+        }
+        let times2: HashSet<u128> = HashSet::from_iter(times.clone());
+        assert_eq!(times.len(), times2.len() + 3);
+    }
+
+    // ThrottledInterval tick less times than tokio interval, if there're sleeps
+    #[allow(non_snake_case)]
+    #[tokio::test]
+    async fn test_RustDesk_interval_sleep() {
+        let base_intervals = [interval_maker, interval_at_maker];
+        for (i, maker) in base_intervals.into_iter().enumerate() {
+            let mut timer = rustdesk_interval(maker());
+            let mut times = Vec::new();
+            sleep(Duration::from_secs(3)).await;
+            loop {
+                tokio::select! {
+                    _ = timer.tick() => {
+                        times.push(get_timestamp_secs());
+                        if times.len() == 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+            // No multiple ticks in the `interval` time.
+            // Values in "times" are unique and are less than normal tokio interval.
+            // See previous test (test_tokio_time_interval_sleep) for comparison.
+            let times2: HashSet<u128> = HashSet::from_iter(times.clone());
+            assert_eq!(times.len(), times2.len(), "test: {}", i);
+        }
+    }
+
+    #[test]
+    fn test_duration_multiplication() {
+        let dur = Duration::from_secs(1);
+
+        assert_eq!(dur * 2, Duration::from_secs(2));
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 0.9),
+            Duration::from_millis(900)
+        );
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 0.923),
+            Duration::from_millis(923)
+        );
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 0.923 * 1e-3),
+            Duration::from_micros(923)
+        );
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 0.923 * 1e-6),
+            Duration::from_nanos(923)
+        );
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 0.923 * 1e-9),
+            Duration::from_nanos(1)
+        );
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 0.5 * 1e-9),
+            Duration::from_nanos(1)
+        );
+        assert_eq!(
+            Duration::from_secs_f64(dur.as_secs_f64() * 0.499 * 1e-9),
+            Duration::from_nanos(0)
+        );
+    }
+
+    #[test]
+    fn test_can_dial_url_answers_the_question_is_public_asked() {
+        // netguard L1: `is_public` matched the vendor's hosted domain by name, which put that name
+        // in the binary. The replacement asks the guard instead: a target this build may dial is,
+        // by construction, a literal address inside the operator's allow-list (or loopback) - and
+        // nothing outside it, hosted cloud included.
+        assert!(can_dial_url("http://127.0.0.1:21116"));
+        assert!(can_dial_url("https://127.0.0.1:21114"));
+        // Unlisted private space, a name form (a resolver query would itself be egress), an empty
+        // URL and a bare host are all "not dial-able", so every caller keeps its skip.
+        assert!(!can_dial_url("http://192.168.1.10:21116"));
+        assert!(!can_dial_url("http://192.168.1.1"));
+        assert!(!can_dial_url("http://8.8.8.8:21116"));
+        assert!(!can_dial_url("localhost"));
+        assert!(!can_dial_url(""));
+        // A port-less literal is still a literal: the guard only ever sees the address, not a port.
+        assert!(can_dial_url("http://127.0.0.1"));
+    }
+
+    #[test]
+    fn test_mouse_event_constants_and_mask_layout() {
+        use super::input::*;
+
+        // Verify MOUSE_TYPE constants are unique and within the mask range.
+        let types = [
+            MOUSE_TYPE_MOVE,
+            MOUSE_TYPE_DOWN,
+            MOUSE_TYPE_UP,
+            MOUSE_TYPE_WHEEL,
+            MOUSE_TYPE_TRACKPAD,
+            MOUSE_TYPE_MOVE_RELATIVE,
+        ];
+
+        let mut seen = std::collections::HashSet::new();
+        for t in types.iter() {
+            assert!(seen.insert(*t), "Duplicate mouse type: {}", t);
+            assert_eq!(
+                *t & MOUSE_TYPE_MASK,
+                *t,
+                "Mouse type {} exceeds mask {}",
+                t,
+                MOUSE_TYPE_MASK
+            );
+        }
+
+        // The mask layout is: lower 3 bits for type, upper bits for buttons (shifted by 3).
+        let combined_mask = MOUSE_TYPE_DOWN | ((MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT) << 3);
+        assert_eq!(combined_mask & MOUSE_TYPE_MASK, MOUSE_TYPE_DOWN);
+        assert_eq!(combined_mask >> 3, MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT);
+    }
+
+    /// A stand-in rendezvous server on loopback: accepts one connection and hands it to `serve`.
+    async fn rendezvous_stub<F, Fut>(serve: F) -> String
+    where
+        F: FnOnce(hbb_common::tcp::FramedStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let listener = hbb_common::tcp::new_listener("127.0.0.1:0", false)
+            .await
+            .unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            if let Ok((stream, addr)) = listener.accept().await {
+                serve(hbb_common::tcp::FramedStream::from(stream, addr)).await;
+            }
+        });
+        host
+    }
+
+    fn server_key() -> (String, sign::SecretKey) {
+        let (pk, sk) = sign::gen_keypair();
+        (encode64(pk.0), sk)
+    }
+
+    fn signed_key_exchange(
+        pk: &box_::PublicKey,
+        sk: &sign::SecretKey,
+        version: u32,
+    ) -> KeyExchange {
+        let params = KxParams {
+            pk: pk.0.to_vec().into(),
+            version,
+            ..Default::default()
+        };
+        let mut payload = hbb_common::tcp::KX_PARAMS_DOMAIN.to_vec();
+        payload.extend_from_slice(&params.write_to_bytes().unwrap());
+        KeyExchange {
+            keys: vec![sign::sign(&pk.0, sk).into()],
+            version,
+            signed_params: sign::sign(&payload, sk).into(),
+            ..Default::default()
+        }
+    }
+
+    async fn connect(host: &str) -> Stream {
+        hbb_common::socket_client::connect_tcp(host.to_owned(), 3000)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_secure_tcp_required_refuses_a_server_without_the_exchange() {
+        let (key, _) = server_key();
+        // A server from before the exchange answers the first message with something else.
+        let serve = |mut s: hbb_common::tcp::FramedStream| async move {
+            let mut msg = RendezvousMessage::new();
+            msg.set_register_peer_response(RegisterPeerResponse::new());
+            s.send(&msg).await.unwrap();
+            sleep(Duration::from_secs(2)).await;
+        };
+        let host = rendezvous_stub(serve).await;
+        let mut conn = connect(&host).await;
+        assert!(secure_tcp_required(&mut conn, &key).await.is_err());
+        assert!(!conn.is_secured());
+        // The legacy call tolerates the same server, and the stream stays in the clear.
+        let host = rendezvous_stub(serve).await;
+        let mut conn = connect(&host).await;
+        secure_tcp(&mut conn, &key).await.unwrap();
+        assert!(!conn.is_secured());
+    }
+
+    #[tokio::test]
+    async fn test_secure_tcp_required_refuses_a_closed_connection() {
+        let (key, _) = server_key();
+        let host = rendezvous_stub(|s| async move { drop(s) }).await;
+        let mut conn = connect(&host).await;
+        assert!(secure_tcp_required(&mut conn, &key).await.is_err());
+        assert!(!conn.is_secured());
+    }
+
+    #[tokio::test]
+    async fn test_secure_tcp_required_accepts_a_completed_exchange() {
+        let (key, sk) = server_key();
+        let host = rendezvous_stub(move |mut s| async move {
+            let (eph_pk, eph_sk) = box_::gen_keypair();
+            let mut msg = RendezvousMessage::new();
+            msg.set_key_exchange(KeyExchange {
+                keys: vec![sign::sign(&eph_pk.0, &sk).into()],
+                ..Default::default()
+            });
+            s.send(&msg).await.unwrap();
+            // The client's reply must decode to a key with the ephemeral secret half.
+            let reply = s.next_timeout(3000).await.unwrap().unwrap();
+            let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
+            let Some(rendezvous_message::Union::KeyExchange(ex)) = reply.union else {
+                panic!("expected the client's key exchange");
+            };
+            hbb_common::tcp::Encrypt::decode(&ex.keys[1], &ex.keys[0], &eph_sk).unwrap();
+        })
+        .await;
+        let mut conn = connect(&host).await;
+        secure_tcp_required(&mut conn, &key).await.unwrap();
+        assert!(conn.is_secured());
+    }
+
+    // The stand-in does what hbbs does at version 1: advertises it and splits the exchanged key
+    // over the same transcript. Neither side's unit tests can catch a client that puts a
+    // different byte string into the transcript than the server does; only a frame crossing
+    // between the two can.
+    #[tokio::test]
+    async fn test_secure_tcp_version_1_keys_match_the_server_both_ways() {
+        let (key, sk) = server_key();
+        let host = rendezvous_stub(move |mut s| async move {
+            let (eph_pk, eph_sk) = box_::gen_keypair();
+            let mut msg = RendezvousMessage::new();
+            msg.set_key_exchange(KeyExchange {
+                keys: vec![sign::sign(&eph_pk.0, &sk).into()],
+                version: 1,
+                ..Default::default()
+            });
+            s.send(&msg).await.unwrap();
+            let reply = s.next_timeout(3000).await.unwrap().unwrap();
+            let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
+            let Some(rendezvous_message::Union::KeyExchange(ex)) = reply.union else {
+                panic!("expected the client's key exchange");
+            };
+            let shared =
+                hbb_common::tcp::Encrypt::decode(&ex.keys[1], &ex.keys[0], &eph_sk).unwrap();
+            s.set_key_split(
+                shared,
+                false,
+                &hbb_common::tcp::KxTranscript {
+                    initiator_pk: &ex.keys[0],
+                    responder_pk: &eph_pk.0,
+                    advertised: 1,
+                    picked: ex.version,
+                },
+            )
+            .unwrap();
+            // Answers with the request's serial, so the client learns from its own reply that
+            // the request was read under the right key.
+            let request = s.next_timeout(3000).await.unwrap().unwrap();
+            let request = RendezvousMessage::parse_from_bytes(&request).unwrap();
+            let Some(rendezvous_message::Union::TestNatRequest(nat)) = request.union else {
+                panic!("expected the client's nat request");
+            };
+            let mut msg = RendezvousMessage::new();
+            msg.set_test_nat_response(TestNatResponse {
+                port: nat.serial,
+                ..Default::default()
+            });
+            s.send(&msg).await.unwrap();
+        })
+        .await;
+        let mut conn = connect(&host).await;
+        secure_tcp_required(&mut conn, &key).await.unwrap();
+        let mut msg = RendezvousMessage::new();
+        msg.set_test_nat_request(TestNatRequest {
+            serial: 7,
+            ..Default::default()
+        });
+        conn.send(&msg).await.unwrap();
+        let reply = conn.next_timeout(3000).await.unwrap().unwrap();
+        let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
+        let Some(rendezvous_message::Union::TestNatResponse(nat)) = reply.union else {
+            panic!("expected the server's nat response");
+        };
+        assert_eq!(nat.port, 7);
+    }
+
+    #[tokio::test]
+    async fn test_secure_tcp_legacy_and_signed_servers_exchange_application_data() {
+        for (advertised, signed) in [(0, false), (1, true), (3, true)] {
+            for required in [false, true] {
+                let (key, sk) = server_key();
+                let host = rendezvous_stub(move |mut s| async move {
+                    let (mut eph_pk, eph_sk) = box_::gen_keypair();
+                    let mut msg = RendezvousMessage::new();
+                    let ex = if signed {
+                        eph_pk.0[31] |= 0x80;
+                        signed_key_exchange(&eph_pk, &sk, advertised)
+                    } else {
+                        KeyExchange {
+                            keys: vec![sign::sign(&eph_pk.0, &sk).into()],
+                            ..Default::default()
+                        }
+                    };
+                    msg.set_key_exchange(ex);
+                    s.send(&msg).await.unwrap();
+                    let reply = s.next_timeout(3000).await.unwrap().unwrap();
+                    let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
+                    let Some(rendezvous_message::Union::KeyExchange(ex)) = reply.union else {
+                        panic!("expected the client's key exchange");
+                    };
+                    assert_eq!(ex.keys.len(), 2);
+                    assert_eq!(ex.version, hbb_common::tcp::kx_version_for(advertised));
+                    let shared =
+                        hbb_common::tcp::Encrypt::decode(&ex.keys[1], &ex.keys[0], &eph_sk)
+                            .unwrap();
+                    if ex.version >= 1 {
+                        s.set_key_split(
+                            shared,
+                            false,
+                            &hbb_common::tcp::KxTranscript {
+                                initiator_pk: &ex.keys[0],
+                                responder_pk: &eph_pk.0,
+                                advertised,
+                                picked: ex.version,
+                            },
+                        )
+                        .unwrap();
+                    } else {
+                        s.set_key(shared);
+                    }
+                    let request = s.next_timeout(3000).await.unwrap().unwrap();
+                    let request = RendezvousMessage::parse_from_bytes(&request).unwrap();
+                    let Some(rendezvous_message::Union::TestNatRequest(nat)) = request.union else {
+                        panic!("expected the client's nat request");
+                    };
+                    let mut msg = RendezvousMessage::new();
+                    msg.set_test_nat_response(TestNatResponse {
+                        port: nat.serial,
+                        ..Default::default()
+                    });
+                    s.send(&msg).await.unwrap();
+                })
+                .await;
+                let mut conn = connect(&host).await;
+                if required {
+                    secure_tcp_required(&mut conn, &key).await.unwrap();
+                } else {
+                    secure_tcp(&mut conn, &key).await.unwrap();
+                }
+                assert!(conn.is_secured());
+                let mut msg = RendezvousMessage::new();
+                msg.set_test_nat_request(TestNatRequest {
+                    serial: 7,
+                    ..Default::default()
+                });
+                conn.send(&msg).await.unwrap();
+                let reply = conn.next_timeout(3000).await.unwrap().unwrap();
+                let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
+                let Some(rendezvous_message::Union::TestNatResponse(nat)) = reply.union else {
+                    panic!("expected the server's nat response");
+                };
+                assert_eq!(nat.port, 7);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_secure_tcp_rejects_unverified_versions_before_reply() {
+        let (key, sk) = server_key();
+        let (mut eph_pk, _) = box_::gen_keypair();
+        eph_pk.0[31] |= 0x80;
+        let (other_pk, _) = box_::gen_keypair();
+        let (_, other_sk) = sign::gen_keypair();
+        for case in [
+            "missing_signature",
+            "stripped_version_and_signature",
+            "cleared_marker_and_stripped_fields",
+            "lowered_version",
+            "raised_version",
+            "replaced_public_key",
+            "invalid_signature",
+            "wrong_signer",
+            "unstructured_payload",
+            "undomained_params",
+            "signed_id_pk_as_params",
+        ] {
+            let mut ex = signed_key_exchange(&eph_pk, &sk, 1);
+            match case {
+                "missing_signature" => ex.signed_params = Bytes::new(),
+                "stripped_version_and_signature" => {
+                    ex.signed_params = Bytes::new();
+                    ex.version = 0;
+                }
+                "cleared_marker_and_stripped_fields" => {
+                    let mut signed_pk = ex.keys[0].to_vec();
+                    *signed_pk.last_mut().unwrap() &= 0x7f;
+                    ex.keys[0] = signed_pk.into();
+                    ex.signed_params = Bytes::new();
+                    ex.version = 0;
+                }
+                "lowered_version" => ex.version = 0,
+                "raised_version" => ex.version = 2,
+                "replaced_public_key" => ex.keys[0] = sign::sign(&other_pk.0, &sk).into(),
+                "invalid_signature" => {
+                    let mut signed = ex.signed_params.to_vec();
+                    signed[0] ^= 1;
+                    ex.signed_params = signed.into();
+                }
+                "wrong_signer" => {
+                    ex.signed_params = signed_key_exchange(&eph_pk, &other_sk, 1).signed_params;
+                }
+                "unstructured_payload" => {
+                    let mut payload = eph_pk.0.to_vec();
+                    payload.extend_from_slice(&1u32.to_le_bytes());
+                    ex.signed_params = sign::sign(&payload, &sk).into();
+                }
+                "undomained_params" => {
+                    let params = KxParams {
+                        pk: eph_pk.0.to_vec().into(),
+                        version: 1,
+                        ..Default::default()
+                    };
+                    ex.signed_params = sign::sign(&params.write_to_bytes().unwrap(), &sk).into();
+                }
+                "signed_id_pk_as_params" => {
+                    // The server signs IdPk with the same key; its `id` sits where `pk` does.
+                    let mut pk = [0x2au8; box_::PUBLICKEYBYTES];
+                    pk[30] = 0xc2;
+                    pk[31] = 0xaa;
+                    let id_pk = IdPk {
+                        id: String::from_utf8(pk.to_vec()).unwrap(),
+                        pk: vec![7u8; box_::PUBLICKEYBYTES].into(),
+                        ..Default::default()
+                    };
+                    ex.keys[0] = sign::sign(&pk, &sk).into();
+                    ex.version = 0;
+                    ex.signed_params = sign::sign(&id_pk.write_to_bytes().unwrap(), &sk).into();
+                }
+                _ => unreachable!(),
+            }
+            for required in [false, true] {
+                let mut msg = RendezvousMessage::new();
+                msg.set_key_exchange(ex.clone());
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let host = rendezvous_stub(move |mut s| async move {
+                    s.send(&msg).await.unwrap();
+                    tx.send(s.next_timeout(3000).await.is_none()).unwrap();
+                })
+                .await;
+                let mut conn = connect(&host).await;
+                let result = if required {
+                    secure_tcp_required(&mut conn, &key).await
+                } else {
+                    secure_tcp(&mut conn, &key).await
+                };
+                assert!(result.is_err(), "accepted {case}, required={required}");
+                assert!(!conn.is_secured());
+                drop(conn);
+                assert!(rx.await.unwrap(), "replied to {case}, required={required}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_dtls_fingerprint_travels_signed_and_binds() {
+        let (pk, sk) = sign::gen_keypair();
+        let fp = "sha-256 0A:1B:2C";
+        let signed = sign::sign(
+            &IdPk {
+                id: "123456789".to_owned(),
+                pk: Bytes::from(vec![7u8; 32]),
+                dtls_fingerprint: fp.to_owned(),
+                ..Default::default()
+            }
+            .write_to_bytes()
+            .unwrap(),
+            &sk,
+        );
+
+        let (id, their_pk, signed_fp, _) = decode_id_pk_dtls(&signed, &pk).unwrap();
+        assert_eq!(id, "123456789");
+        assert_eq!(their_pk, [7u8; 32]);
+        assert_eq!(signed_fp, fp);
+        assert!(dtls_fingerprint_bound(&signed_fp, fp));
+        assert!(!dtls_fingerprint_bound(&signed_fp, "sha-256 0A:1B:2D"));
+        assert!(!dtls_fingerprint_bound("", ""));
+
+        // The fingerprint is under the signature: a blob verified with another key yields
+        // nothing, and one whose payload was edited in transit fails verification.
+        let (other_pk, _) = sign::gen_keypair();
+        assert!(decode_id_pk_dtls(&signed, &other_pk).is_err());
+        let mut tampered = signed.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(decode_id_pk_dtls(&tampered, &pk).is_err());
+
+        // `decode_id_pk` is the same blob minus the fingerprint, so the field is invisible to
+        // non-WebRTC handshakes.
+        assert_eq!(decode_id_pk(&signed, &pk).unwrap(), (id, their_pk));
+    }
+}
