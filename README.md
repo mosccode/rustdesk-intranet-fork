@@ -17,8 +17,8 @@ it was forked from.
   connect/send and every inbound accept/datagram. Anything outside private IPv4 space is refused
   with an audit line; there is no retry and no fallback transport.
 - **Direct connections only.** A peer is reached by entering a literal IP address; the connection
-  goes to TCP 21118 on that address. If the direct connection fails, the session fails - it does
-  not fall back to a relay.
+  goes to TCP 21118 on that address, or to the port you set (see Direct connection port below).
+  If the direct connection fails, the session fails - it does not fall back to a relay.
 - **The allow-list is yours, not the source code's - and it is optional.** Nothing has to be
   configured to get an intranet working: with no entries the guard allows all private space
   (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`, `169.254/16`) and nothing else. Listing ranges
