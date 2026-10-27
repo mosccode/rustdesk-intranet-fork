@@ -62,6 +62,12 @@ for this build, then lets you add and remove lines and save. Saving validates wi
 as startup - one refused line refuses the whole save and names the line - and reloads the list in
 the running process, so the machine you are typing on can connect immediately without a restart.
 
+On an **installed** build the whole Security page starts read-only: that is upstream's own lock, and
+you clear it with the **Unlock security settings** card at the top of the page (UAC prompt, or the
+unlock PIN if one was set). The portable build does not show that gate. Nothing in this fork pins
+the allow-list card, the port box or any other control that is not listed as a forced option -
+`enable-lan-discovery`, `direct-server` and the two upstream whitelists stay grey on purpose.
+
 Two honest limits:
 
 - Saving requires **this machine's permanent password** (the one set under Settings · Security ·
