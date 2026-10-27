@@ -26,6 +26,18 @@ required by AGPL-3.0 section 5(a). Modifications are dated 2026-10.
 ## Configuration and UI
 
 - Added the intranet allow-list file and its commented template.
+- Added an allow-list editor to the desktop settings page: it shows the enforced entry count and the
+  resolved file path, edits the file through the same validation the guard uses at startup, refuses a
+  whole save when one line is refused, reloads the list in the running process, and requires this
+  machine's permanent password for the write. Reading is not gated - the file is plain text any local
+  account can open - only changing it is.
+- The gate reuses the password storage this build already keeps (`Config::verify_local_permanent_password`,
+  i.e. the same hashed-storage check plus constant-time compare the auth path uses). No second
+  credential is stored, and a wrong answer is written to `netguard-audit.log` like any other refused
+  local action.
+- Removed the two upstream whitelist cards from the desktop settings page. `whitelist` and
+  `id-whitelist` are pinned empty by the forced options, so those cards accepted edits and discarded
+  them while still looking usable.
 - Made the direct-connection port operator-settable: both the listener and the dial now read one
   option (`direct-access-port`) through a single `netguard::direct_peer_port()`, so the two ends
   cannot drift apart. The default is still `21118`.

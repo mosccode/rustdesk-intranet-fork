@@ -94,7 +94,8 @@ const ALLOWLIST_TEMPLATE: &str = "\
 ///
 /// A missing file is created from `ALLOWLIST_TEMPLATE` (all examples commented out), so the
 /// operator has something to edit; a missing file therefore means "only loopback", not "allow
-/// everything".
+/// everything". [`store_allowlist_text`] is the other way in - the settings page uses it and does
+/// not need a restart.
 pub fn init_allowlist() {
     let path = allowlist_path();
     let text = match std::fs::read_to_string(&path) {
@@ -114,28 +115,7 @@ pub fn init_allowlist() {
         }
     };
 
-    let mut list = Vec::new();
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        match parse_allowlist_entry(line) {
-            Ok(cidr) => list.push(cidr),
-            Err(reason) => {
-                audit_denied("local", line, "netguard::init_allowlist", reason);
-            }
-        }
-    }
-    list.sort_by_key(|c| (c.base(), c.prefix));
-    list.dedup();
-    let count = list.len();
-    {
-        let mut guard = allowlist_store()
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = list;
-    }
+    let count = install_allowlist(allowlist_from_text(&text, "netguard::init_allowlist").0);
     if count == 0 {
         crate::log::warn!(
             "netguard: allow-list is empty ({}); only 127.0.0.1 is reachable. Add your intranet ranges, one per line.",
@@ -149,6 +129,83 @@ pub fn init_allowlist() {
             if count == 1 { "y" } else { "ies" }
         );
     }
+}
+
+/// The allow-list as the operator would edit it: the file verbatim, or the commented template when
+/// the file is not there yet. The settings page starts from this so the explanatory comments - and
+/// anything else the operator keeps in that file - are never silently dropped.
+pub fn allowlist_text() -> String {
+    match std::fs::read_to_string(allowlist_path()) {
+        Ok(text) => text,
+        Err(_) => ALLOWLIST_TEMPLATE.to_owned(),
+    }
+}
+
+/// Validate, write and make live in this process. Returns how many entries the guard now enforces.
+///
+/// One refused line refuses the whole write, on purpose. A card that saved `8.8.8.0/24` alongside a
+/// good range and then reported "1 of 2 entries loaded" would leave the operator believing the
+/// public range was allowed; here the edit simply fails and says which line, so the file on disk and
+/// the list in memory cannot disagree.
+pub fn store_allowlist_text(text: &str) -> ResultType<usize> {
+    let (list, rejected) = allowlist_from_text(text, "netguard::store_allowlist_text");
+    if !rejected.is_empty() {
+        return Err(anyhow::anyhow!(
+            "refused: {}",
+            rejected.join("; ")
+        ));
+    }
+    let path = allowlist_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("netguard: cannot create {:?}: {}", parent, e))?;
+    }
+    std::fs::write(&path, text)
+        .map_err(|e| anyhow::anyhow!("netguard: cannot write {:?}: {}", path, e))?;
+    let count = install_allowlist(list);
+    crate::log::info!(
+        "netguard: allow-list edited through the UI, {} entr{} now enforced ({})",
+        count,
+        if count == 1 { "y" } else { "ies" },
+        path.display()
+    );
+    Ok(count)
+}
+
+/// Parse every non-comment line, auditing the ones the guard refuses. Returns the accepted list and
+/// the refused lines with their `reason=` for the caller to show.
+///
+/// Split out from [`init_allowlist`] and [`store_allowlist_text`] so the refusal rules are testable
+/// without touching the config directory.
+fn allowlist_from_text(text: &str, ctx: &str) -> (Vec<CidrV4>, Vec<String>) {
+    let mut list = Vec::new();
+    let mut rejected = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_allowlist_entry(line) {
+            Ok(cidr) => list.push(cidr),
+            Err(reason) => {
+                audit_denied("local", line, ctx, reason);
+                rejected.push(format!("{} ({})", line, reason));
+            }
+        }
+    }
+    list.sort_by_key(|c| (c.base(), c.prefix));
+    list.dedup();
+    (list, rejected)
+}
+
+/// Swap the parsed list into the process-wide store and report how many entries it holds.
+fn install_allowlist(list: Vec<CidrV4>) -> usize {
+    let count = list.len();
+    let mut guard = allowlist_store()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = list;
+    count
 }
 
 /// One line of the allow-list. Refusals carry the audit `reason=`.
@@ -972,6 +1029,58 @@ mod tests {
         ] {
             assert!(parse_allowlist_entry(bad).is_err(), "{} must be rejected", bad);
         }
+    }
+
+    #[test]
+    fn allowlist_from_text_keeps_the_good_lines_and_names_the_bad_one() {
+        // The card shows the operator this string when a write is refused, so it has to carry both
+        // the offending line and the audit reason.
+        let (list, rejected) = allowlist_from_text(
+            "192.168.10.0/24\n8.8.8.0/24\n192.168.10.0/24\n",
+            "netguard::test::allowlist_from_text",
+        );
+        assert_eq!(list.len(), 1, "the duplicate must fold into one entry");
+        assert_eq!(rejected.len(), 1, "{:?}", rejected);
+        assert!(rejected[0].starts_with("8.8.8.0/24"), "{}", rejected[0]);
+        assert!(
+            rejected[0].contains("reason=allowlist_not_private_space"),
+            "{}",
+            rejected[0]
+        );
+    }
+
+    #[test]
+    fn allowlist_from_text_reads_comments_the_way_the_template_writes_them() {
+        // Shipped template: every example is commented, so a fresh install parses to zero entries.
+        // That is the whole reason "cannot connect" is the expected first behaviour.
+        let (list, rejected) = allowlist_from_text(ALLOWLIST_TEMPLATE, "netguard::test::comments");
+        assert!(list.is_empty(), "{:?}", list);
+        assert!(rejected.is_empty(), "{:?}", rejected);
+
+        // Inline comment after a value, indentation, and blank lines are not entries.
+        let (list, rejected) = allowlist_from_text(
+            "\n  10.20.30.0/24 # the office  \n# whole line\n172.16.5.5\n",
+            "netguard::test::comments",
+        );
+        assert!(rejected.is_empty(), "{:?}", rejected);
+        assert_eq!(list.len(), 2, "{:?}", list);
+    }
+
+    #[test]
+    fn an_empty_allowlist_is_valid_input_not_an_error() {
+        // Closing the gate has to be an edit the card accepts, otherwise the only way to reach
+        // deny-all is by hand.
+        let (list, rejected) = allowlist_from_text("", "netguard::test::empty");
+        assert!(list.is_empty());
+        assert!(rejected.is_empty(), "{:?}", rejected);
+
+        // A refused line refuses the whole write, before anything touches the config directory.
+        // (Only the refusal branch is exercised here - the accepting branch writes the real file.)
+        let err = store_allowlist_text("192.168.10.0/24\nexample.com\n")
+            .expect_err("a hostname must not be savable")
+            .to_string();
+        assert!(err.contains("example.com"), "{}", err);
+        assert!(err.contains("reason=allowlist_not_literal_ipv4"), "{}", err);
     }
 
     #[test]

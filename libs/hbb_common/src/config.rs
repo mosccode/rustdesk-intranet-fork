@@ -28,7 +28,8 @@ pub use permanent_password::{
 };
 use permanent_password::{
     decode_permanent_password_h1_from_hashed_storage, decrypt_permanent_password_str_or_original,
-    encode_permanent_password_encrypted_storage_from_h1, password_is_empty_or_not_hashed,
+    encode_permanent_password_encrypted_storage_from_h1,
+    local_permanent_password_storage_matches_plain, password_is_empty_or_not_hashed,
     preset_permanent_password_storage_matches_plain, DEFAULT_SALT_LEN, PASSWORD_ENC_VERSION,
 };
 
@@ -1645,6 +1646,40 @@ impl Config {
     pub fn has_local_permanent_password() -> bool {
         let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
         local_permanent_password_storage_is_usable_for_auth(&local_storage, &local_salt)
+    }
+
+    /// Check a password typed by someone sitting at this machine against the permanent password
+    /// this build would use to accept an incoming session: local storage first, then the
+    /// build-time preset - the same two places [`Config::has_permanent_password`] looks.
+    ///
+    /// Purely local and side-effect free (no network, no config write, salt taken as stored, so it
+    /// never triggers the auto-generate path in `get_salt()`), and the hash comparison is the
+    /// constant-time one the auth path uses. Temporary passwords deliberately do not count: they
+    /// are rotated and shown on screen, so they are not an operator-level credential.
+    ///
+    /// `false` when no permanent password is configured anywhere. Callers must not read that as
+    /// "anything goes" - use [`Config::has_permanent_password`] to tell the two apart when the
+    /// difference is worth showing the operator.
+    ///
+    /// On an installed build the service owns the credential and pushes its storage *and* salt into
+    /// the user config (`set_permanent_password_storage_for_sync`); this reads that synced copy so
+    /// the UI can answer without an IPC round trip. A client that has never received the sync - e.g.
+    /// the service was configured from another account - therefore reports "no password", which is
+    /// the conservative answer, not a hole.
+    pub fn verify_local_permanent_password(input: &str) -> bool {
+        if input.is_empty() {
+            return false;
+        }
+        let (local_storage, local_salt) = Self::get_local_permanent_password_storage_and_salt();
+        if !local_storage.is_empty() {
+            return local_permanent_password_storage_matches_plain(
+                &local_storage,
+                &local_salt,
+                input,
+            );
+        }
+        let (preset_storage, preset_salt) = Self::get_preset_password_storage_and_salt();
+        preset_permanent_password_storage_matches_plain(&preset_storage, &preset_salt, input)
     }
 
     // This shouldn't happen under normal circumstances because the salt

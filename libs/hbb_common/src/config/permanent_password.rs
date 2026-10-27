@@ -137,8 +137,17 @@ pub fn decode_preset_password_h1_from_storage(
     decode_password_h1_after_prefix(storage, HBBS_PRESET_PASSWORD_HASH_PREFIX)
 }
 
-#[cfg(test)]
-fn local_permanent_password_storage_matches_plain(storage: &str, salt: &str, input: &str) -> bool {
+/// Does `input` match the locally persisted permanent password?
+///
+/// Was `#[cfg(test)]`-only; the settings page now needs the same comparison to gate edits to the
+/// netguard allow-list, so it is visible to `config.rs`. Behaviour is unchanged: hashed storage is
+/// compared through `compute_permanent_password_h1` + constant-time `memcmp`, legacy storage falls
+/// back to a plain string compare.
+pub(super) fn local_permanent_password_storage_matches_plain(
+    storage: &str,
+    salt: &str,
+    input: &str,
+) -> bool {
     if storage.is_empty() || input.is_empty() {
         return false;
     }

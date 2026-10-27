@@ -20,9 +20,10 @@ it was forked from.
   goes to TCP 21118 on that address. If the direct connection fails, the session fails - it does
   not fall back to a relay.
 - **The allow-list is yours, not the source code's.** Edit
-  `intranet-allowlist.conf` in the application config directory (see below). Only private IPv4
-  space is accepted; public addresses are rejected and logged, so a configuration mistake cannot
-  turn this build back into an internet client.
+  `intranet-allowlist.conf` in the application config directory, or use the editor under Settings ·
+  Security (see Configuration below). Only private IPv4 space is accepted; public addresses are
+  rejected and logged, so a configuration mistake cannot turn this build back into an internet
+  client.
 - **Server-shaped settings are removed.** The ID/relay-server dialog, proxy dialog, WebSocket
   switch, generic server test, `id@server` targets and domain-name targets are gone or fail
   before dialing.
@@ -33,7 +34,7 @@ Prebuilt Windows x64 binaries are attached to releases in this repository. Each 
 source commit it was built from.
 
 - `rustdesk-intranet-1.5.0-x86_64.exe` - a single-file portable build. Double-click to run; it
-  unpacks its payload to `%LOCALAPPDATA%ustdesk`. The in-app **Install** card installs the same
+  unpacks its payload to `%LOCALAPPDATA%\rustdesk`. The in-app **Install** card installs the same
   files to Program Files (UAC required), exactly like the upstream portable executable.
 - `rustdesk-intranet-windows-x64.zip` - the full `Release/` directory, plus the license files.
 
@@ -53,13 +54,40 @@ scan over the produced binaries.
 
 ## Configuration
 
+### Editing the allow-list inside the app
+
+**Settings · Security · Intranet direct-connect allow-list** (`Edit`) opens the file in the app
+itself: it shows how many entries the guard is enforcing right now and the exact path of the file
+for this build, then lets you add and remove lines and save. Saving validates with the same rules
+as startup - one refused line refuses the whole save and names the line - and reloads the list in
+the running process, so the machine you are typing on can connect immediately without a restart.
+
+Two honest limits:
+
+- Saving requires **this machine's permanent password** (the one set under Settings · Security ·
+  Password). If none is set there is nothing to check the edit against, and the dialog says so
+  instead of letting the change through. The gate is on the write only: the file itself is plain
+  text in the config directory, readable by any local account, so gating the read would protect
+  nothing.
+- The list is read by each process at its own start. Saving applies to the process that saved; the
+  side that **accepts** incoming connections picks the file up on its next start, so after changing
+  it on a controlled machine restart that program (or the service).
+
+The two upstream cards **Use IP Whitelisting** and **Use ID whitelisting** are gone from the desktop
+settings page. `whitelist` and `id-whitelist` are pinned empty by this build's forced options, so
+every value they wrote came back empty on the next read while the checkbox still looked usable; a
+control that silently drops your input is worse than no control. The card above writes to what the
+guard actually reads.
+
+### Editing the file directly
+
 On first start the application writes a commented template:
 
 - Windows: `%APPDATA%\RustDesk\config\intranet-allowlist.conf`
 - Linux: `~/.config/rustdesk/intranet-allowlist.conf`
 - macOS: `~/Library/Application Support/RustDesk/intranet-allowlist.conf`
 
-Edit it, one entry per line, then restart the application:
+Edit it (or use the card above), one entry per line:
 
 ```conf
 # a CIDR ...

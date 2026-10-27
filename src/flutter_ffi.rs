@@ -1638,6 +1638,92 @@ pub fn main_is_option_fixed(key: String) -> SyncReturn<bool> {
     SyncReturn(is_option_fixed(&key))
 }
 
+// ---------------------------------------------------------------------------
+// netguard 阶段 5: the operator edits the intranet allow-list from inside the app.
+//
+// Reads are ungated on purpose. The list is a plain text file in the config directory, so any local
+// account can open it in Notepad regardless of what this FFI allows - a UI-side gate there would
+// protect nothing while making the settings card unusable. The *write* is gated on this machine's
+// permanent password, because that is the one action that changes what the process is allowed to
+// reach.
+//
+// Boundary, stated plainly: this stops a person at a logged-in console from widening the policy
+// casually. It does not stop someone with write access to the disk, who can edit the file and
+// restart the program; that is the same boundary the audit log has.
+// ---------------------------------------------------------------------------
+
+/// The allow-list exactly as the operator would edit it, comments included; the shipped template
+/// when the file does not exist yet (which is what a fresh install sees).
+pub fn main_intranet_allowlist_text() -> SyncReturn<String> {
+    SyncReturn(hbb_common::netguard::allowlist_text())
+}
+
+/// Where that file is for *this* build. A portable exe keeps it next to itself, an installed one in
+/// the shared config dir, so the card shows the resolved path instead of assuming.
+pub fn main_intranet_allowlist_path() -> SyncReturn<String> {
+    SyncReturn(
+        hbb_common::netguard::allowlist_path()
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
+/// Entries this process enforces right now. `0` means only `127.0.0.1` is reachable - the expected
+/// reading on an install nobody has configured yet.
+pub fn main_intranet_allowlist_count() -> SyncReturn<i32> {
+    SyncReturn(hbb_common::netguard::allowed_cidrs().len() as i32)
+}
+
+/// True when this machine has a permanent password to check an edit against. Without one there is
+/// nothing to gate on, so the settings card says "set a password first" instead of letting the edit
+/// through.
+pub fn main_intranet_password_configured() -> SyncReturn<bool> {
+    SyncReturn(config::Config::has_permanent_password())
+}
+
+/// Validate `text`, write it to [`main_intranet_allowlist_path`], and swap it into this process's
+/// guard, so the control side needs no restart. `password` is re-checked here rather than trusted
+/// from whatever unlocked the dialog.
+///
+/// Deliberately not a `SyncReturn`: this is the call that touches the disk and, when the password is
+/// wrong, sleeps - all of that has to stay off the UI thread.
+///
+/// Returns an empty string when the list landed, `"auth-failed"` when the password did not match
+/// (the card translates that token; a refusal text is `line (reason=...)`, which reads the same in
+/// any language).
+pub fn main_intranet_allowlist_apply(text: String, password: String) -> String {
+    if !verify_intranet_password(&password, "flutter_ffi::main_intranet_allowlist_apply") {
+        return "auth-failed".to_owned();
+    }
+    match hbb_common::netguard::store_allowlist_text(&text) {
+        Ok(count) => {
+            log::info!(
+                "intranet allow-list saved from the settings page; {} entr{} enforced in this process",
+                count,
+                if count == 1 { "y" } else { "ies" }
+            );
+            String::new()
+        }
+        Err(e) => {
+            // `store_allowlist_text` already audited each refused line; nothing was written.
+            log::warn!("intranet allow-list edit refused: {}", e);
+            e.to_string()
+        }
+    }
+}
+
+fn verify_intranet_password(password: &str, ctx: &str) -> bool {
+    let ok = config::Config::verify_local_permanent_password(password);
+    if !ok {
+        // A wrong answer here is a local policy-tamper attempt, so it belongs in the same audit
+        // trail as a refused connection. The pause is not a rate limiter - it only makes repeated
+        // guessing from the UI as slow as it is pointless.
+        hbb_common::netguard::audit_denied("local", "intranet-allowlist-edit", ctx, "reason=password_mismatch");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    ok
+}
+
 pub fn main_get_main_display() -> SyncReturn<String> {
     #[cfg(target_os = "ios")]
     let display_info = "".to_owned();

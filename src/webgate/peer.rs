@@ -703,7 +703,7 @@ fn open_session(ui: &WebUi, value: &Value) {
         state.password_attempts = 0;
     }
 
-    let mut session: Session<WebUi> = Session {
+    let session: Session<WebUi> = Session {
         password: password.clone(),
         ui_handler: ui.clone(),
         server_keyboard_enabled: Arc::new(RwLock::new(true)),
@@ -767,13 +767,12 @@ fn send_mouse(_ui: &WebUi, session: &Session<WebUi>, value: &Value) {
         MOUSE_BUTTON_BACK, MOUSE_BUTTON_FORWARD, MOUSE_BUTTON_LEFT, MOUSE_BUTTON_RIGHT,
         MOUSE_BUTTON_WHEEL, MOUSE_TYPE_DOWN, MOUSE_TYPE_UP, MOUSE_TYPE_WHEEL,
     };
-    let mut mask = 0;
-    match str_field(value, "type").as_str() {
-        "down" => mask = MOUSE_TYPE_DOWN,
-        "up" => mask = MOUSE_TYPE_UP,
-        "wheel" => mask = MOUSE_TYPE_WHEEL,
-        _ => mask = 0,
-    }
+    let mut mask = match str_field(value, "type").as_str() {
+        "down" => MOUSE_TYPE_DOWN,
+        "up" => MOUSE_TYPE_UP,
+        "wheel" => MOUSE_TYPE_WHEEL,
+        _ => 0,
+    };
     let button = match str_field(value, "button").as_str() {
         "left" => MOUSE_BUTTON_LEFT,
         "right" => MOUSE_BUTTON_RIGHT,

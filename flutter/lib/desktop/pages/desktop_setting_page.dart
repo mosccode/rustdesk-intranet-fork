@@ -1384,8 +1384,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
       _OptionCheckBox(context, 'Deny LAN discovery', 'enable-lan-discovery',
           reverse: true, enabled: enabled),
       ...directIp(context),
-      whitelist(),
-      idWhitelist(),
+      intranetAllowlist(),
       ...autoDisconnect(context),
       _OptionCheckBox(context, 'keep-awake-during-incoming-sessions-label',
           kOptionKeepAwakeDuringIncomingSessions,
@@ -1491,102 +1490,166 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     ];
   }
 
-  Widget whitelist() {
+  // Fork (netguard 阶段 5): the intranet allow-list, editable from inside the app.
+  //
+  // This replaces the upstream `whitelist()` card. That one is not merely unused here, it is
+  // misleading: `whitelist` is pinned empty by netguard's `FORCED_OPTIONS`, so every value
+  // `changeWhiteList` wrote came back as "" on the next read while the checkbox still looked
+  // usable - the operator walks away believing a list exists. The guard's real list is a file, and
+  // this card is the editor for it.
+  Widget intranetAllowlist() {
     bool enabled = !locked;
-    // Simple temp wrapper for PR check
-    tmpWrapper() {
-      RxBool hasWhitelist = whitelistNotEmpty().obs;
-      update() async {
-        hasWhitelist.value = whitelistNotEmpty();
-      }
-
-      onChanged(bool? checked) async {
-        changeWhiteList(callback: update);
-      }
-
-      final isOptFixed = isOptionFixed(kOptionWhitelist);
-      return GestureDetector(
-        child: Tooltip(
-          message: translate('whitelist_tip'),
-          child: Obx(() => Row(
-                children: [
-                  Checkbox(
-                          value: hasWhitelist.value,
-                          onChanged: enabled && !isOptFixed ? onChanged : null)
-                      .marginOnly(right: 5),
-                  Offstage(
-                    offstage: !hasWhitelist.value,
-                    child: MouseRegion(
-                      child: const Icon(Icons.warning_amber_rounded,
-                              color: Color.fromARGB(255, 255, 204, 0))
-                          .marginOnly(right: 5),
-                      cursor: SystemMouseCursors.click,
-                    ),
-                  ),
-                  Expanded(
-                      child: Text(
-                    translate('Use IP Whitelisting'),
-                    style:
-                        TextStyle(color: disabledTextColor(context, enabled)),
-                  ))
-                ],
-              )),
-        ),
-        onTap: enabled
-            ? () {
-                onChanged(!hasWhitelist.value);
-              }
-            : null,
-      ).marginOnly(left: _kCheckBoxLeftMargin);
+    RxInt loaded = bind.mainIntranetAllowlistCount().obs;
+    update() {
+      loaded.value = bind.mainIntranetAllowlistCount();
     }
 
-    return tmpWrapper();
-  }
-
-  Widget idWhitelist() {
-    bool enabled = !locked;
-    RxBool hasIdWhitelist = idWhitelistNotEmpty().obs;
-    update() async {
-      hasIdWhitelist.value = idWhitelistNotEmpty();
-    }
-
-    onChanged(bool? checked) async {
-      changeIdWhiteList(callback: update);
-    }
-
-    final isOptFixed = isOptionFixed(kOptionIdWhitelist);
-    return GestureDetector(
-      child: Tooltip(
-        message: translate('id_whitelist_tip'),
-        child: Obx(() => Row(
+    return Obx(() => Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
               children: [
-                Checkbox(
-                        value: hasIdWhitelist.value,
-                        onChanged: enabled && !isOptFixed ? onChanged : null)
-                    .marginOnly(right: 5),
-                Offstage(
-                  offstage: !hasIdWhitelist.value,
-                  child: MouseRegion(
-                    child: const Icon(Icons.warning_amber_rounded,
-                            color: Color.fromARGB(255, 255, 204, 0))
-                        .marginOnly(right: 5),
-                    cursor: SystemMouseCursors.click,
+                Expanded(
+                  child: Text(
+                    translate('intranet_allowlist'),
+                    style: TextStyle(
+                        fontSize: _kContentFontSize,
+                        color: disabledTextColor(context, enabled)),
                   ),
                 ),
-                Expanded(
-                    child: Text(
-                  translate('Use ID whitelisting'),
-                  style: TextStyle(color: disabledTextColor(context, enabled)),
-                ))
+                ElevatedButton(
+                  onPressed:
+                      enabled ? () => editIntranetAllowlist(update) : null,
+                  child: Text(translate('intranet_allowlist_edit')),
+                ),
               ],
-            )),
-      ),
-      onTap: enabled
-          ? () {
-              onChanged(!hasIdWhitelist.value);
-            }
-          : null,
-    ).marginOnly(left: _kCheckBoxLeftMargin);
+            ),
+            Text(
+              '${translate('intranet_allowlist_loaded')}: ${loaded.value}',
+              style: const TextStyle(fontSize: 13),
+            ).marginOnly(top: 2),
+            SelectableText(
+              bind.mainIntranetAllowlistPath(),
+              style: const TextStyle(fontSize: 12),
+            ).marginOnly(top: 2),
+            Text(
+              translate(loaded.value == 0
+                  ? 'intranet_allowlist_empty_tip'
+                  : 'intranet_allowlist_tip'),
+              style: TextStyle(
+                fontSize: 12,
+                color: loaded.value == 0
+                    ? const Color.fromARGB(255, 255, 170, 0)
+                    : null,
+              ),
+            ).marginOnly(top: 4),
+          ],
+        )).marginOnly(
+            left: _kCheckBoxLeftMargin,
+            right: _kContentHMargin,
+            top: 6,
+            bottom: 6);
+  }
+
+  /// Editor dialog for the allow-list.
+  ///
+  /// The password box is part of the same form rather than a separate unlock step: the write is
+  /// checked against this machine's permanent password in `main_intranet_allowlist_apply`, so a
+  /// wrong answer costs nothing but a refused save, and the text already typed stays on screen.
+  /// Reading the list is not gated - the file is plain text in the config directory that any local
+  /// account can open - only changing it is.
+  void editIntranetAllowlist(Function()? callback) {
+    final listController =
+        TextEditingController(text: bind.mainIntranetAllowlistText());
+    final passwordController = TextEditingController();
+    final configured = bind.mainIntranetPasswordConfigured();
+    var error = "";
+    var authError = "";
+    var saving = false;
+    gFFI.dialogManager.show((setState, close, context) {
+      save() async {
+        setState(() {
+          error = "";
+          authError = "";
+          saving = true;
+        });
+        final res = await bind.mainIntranetAllowlistApply(
+            text: listController.text, password: passwordController.text);
+        saving = false;
+        if (res.isEmpty) {
+          callback?.call();
+          close();
+          return;
+        }
+        if (res == "auth-failed") {
+          authError = translate('intranet_allowlist_auth_failed');
+        } else {
+          // `res` is `line (reason=...)` from the guard - technical, and the same in every locale.
+          error = '${translate('intranet_allowlist_refused')}: $res';
+        }
+        setState(() {});
+      }
+
+      return CustomAlertDialog(
+        title: Text(translate('intranet_allowlist')),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(translate('intranet_allowlist_format_tip'),
+                  style: const TextStyle(fontSize: 12)),
+              const SizedBox(height: 8),
+              TextField(
+                controller: listController,
+                minLines: 8,
+                maxLines: 14,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: InputDecoration(
+                  errorText: error.isEmpty ? null : error,
+                  border: const OutlineInputBorder(),
+                  contentPadding: const EdgeInsets.all(8),
+                ),
+              ).workaroundFreezeLinuxMint(),
+              const SizedBox(height: 12),
+              Text(
+                translate(configured
+                    ? 'intranet_allowlist_password'
+                    : 'intranet_allowlist_password_missing'),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: configured
+                      ? null
+                      : const Color.fromARGB(255, 255, 170, 0),
+                ),
+              ),
+              const SizedBox(height: 4),
+              TextField(
+                controller: passwordController,
+                obscureText: true,
+                autocorrect: false,
+                enableSuggestions: false,
+                enabled: configured,
+                decoration: InputDecoration(
+                  errorText: authError.isEmpty ? null : authError,
+                ),
+              ).workaroundFreezeLinuxMint(),
+              // NOT use Offstage to wrap LinearProgressIndicator
+              if (saving) const LinearProgressIndicator(),
+            ],
+          ),
+        ),
+        actions: [
+          dialogButton("Cancel", onPressed: close, isOutline: true),
+          dialogButton(
+            'intranet_allowlist_save',
+            onPressed: configured && !saving ? () => save() : null,
+          ),
+        ],
+        onCancel: close,
+      );
+    });
   }
 
   Widget hide_cm(bool enabled) {

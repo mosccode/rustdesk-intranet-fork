@@ -58,11 +58,13 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Writer = Arc<Mutex<TcpStream>>;
 
-/// What the bridge may hand to the socket: one JPEG frame, one JSON event, or the end.
+/// What the bridge may hand to the socket: one JPEG frame or one JSON event.
+///
+/// There is deliberately no "end of stream" variant: `detach()` drops the sender, which makes
+/// `pump()`'s `recv()` fail, and that is how the pump learns the session is gone.
 pub enum OutMsg {
     Frame(Vec<u8>),
     Event(String),
-    Closed,
 }
 
 /// Bind the operator's chosen address and serve until the process exits.
@@ -440,7 +442,6 @@ fn pump(_token: peer::Token, writer: Writer, rx: Receiver<OutMsg>) {
         // each one carries state the page has not seen).
         let mut frame: Option<Vec<u8>> = None;
         let mut events: Vec<String> = Vec::new();
-        let mut closed = false;
         let mut got_any = false;
         let mut first = Some(next);
         while let Some(msg) = first.take() {
@@ -448,7 +449,6 @@ fn pump(_token: peer::Token, writer: Writer, rx: Receiver<OutMsg>) {
             match msg {
                 OutMsg::Frame(jpeg) => frame = Some(jpeg),
                 OutMsg::Event(json) => events.push(json),
-                OutMsg::Closed => closed = true,
             }
             first = rx.try_recv().ok();
         }
@@ -464,9 +464,6 @@ fn pump(_token: peer::Token, writer: Writer, rx: Receiver<OutMsg>) {
             if send_binary(&writer, &jpeg).is_err() {
                 return;
             }
-        }
-        if closed {
-            return;
         }
     }
 }
@@ -609,7 +606,10 @@ pub fn push(sender: &SyncSender<OutMsg>, msg: OutMsg) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Imported here as well as above: a test module should not depend on whether a glob picks up
+    // the parent's anonymous trait import.
     use hbb_common::base64::engine::general_purpose::STANDARD;
+    use hbb_common::base64::Engine as _;
 
     fn local(ip: &str, port: u16) -> SocketAddr {
         SocketAddr::new(ip.parse().unwrap(), port)
