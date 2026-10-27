@@ -66,9 +66,10 @@ required by AGPL-3.0 section 5(a). Modifications are dated 2026-10.
 - Added `src/webgate/` and the `rustdesk-webgate` binary: a browser control console. It serves one
   page and speaks the native protocol to the controlled machine by reusing `Session`, so the
   controlled side is unchanged and listens on the same port it always did.
-- Everything it can be told to do is filtered by the same allow-list the desktop client uses; the
-  listener itself refuses to start without an explicit bind address and passphrase, and accepts
-  peers only from allow-listed addresses.
+- Everything it can be told to do is filtered by the same allow-list the desktop client uses; it
+  starts with no configuration at all (listener on every interface, no passphrase), accepts peers
+  only from allow-listed addresses, and the operator's target address goes through the same guard.
+  `webgate-bind` and `webgate-passphrase` are optional narrowing, not prerequisites.
 - Added `src/webgate/sha1.rs` (RFC 6455 handshake) and `src/webgate/http.rs` (HTTP/1.1 + WebSocket
   framing) rather than adding crate dependencies to this build.
 

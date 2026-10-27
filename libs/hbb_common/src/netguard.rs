@@ -1031,7 +1031,10 @@ fn due_to_write(target: &str) -> bool {
     }
 }
 
-fn now_stamp() -> String {
+/// The local RFC-3339 stamp every audit line starts with. Public because the gateway's status file
+/// (`src/webgate/mod.rs::status_note`) states its time the same way as the audit log does, so an
+/// operator reading both side by side is not comparing two clocks.
+pub fn now_stamp() -> String {
     crate::chrono::Local::now().to_rfc3339()
 }
 

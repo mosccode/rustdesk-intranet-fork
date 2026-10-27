@@ -11,16 +11,20 @@
 // Hard rules implemented in this file:
 //   * the listener binds through netguard's `parse_bind_addr` - a literal address or nothing, no
 //     resolver - and every accepted socket is re-checked with `check_inbound_addr`, which is the
-//     *same* allow-list test the controlled side runs on its own accepts. A browser whose address
-//     is not in `intranet-allowlist.conf` does not get the page;
+//     *same* allow-list test the controlled side runs on its own accepts. 开箱即用那一版（需求方
+//     2026-10-28）不填 `webgate-bind` 时听的是 `0.0.0.0`，所以"哪些地址能用这台网关"完全由这道
+//     入站检查决定：不在放行范围内的浏览器拿不到页面，连不上是被审计过的，不是"看起来连不上"；
 //   * `Host` must name the address the socket actually landed on, and `Origin` must agree with it.
 //     That is what makes a DNS-rebinding attempt (a hostname that resolves to this machine) fail
-//     rather than merely look odd, because this build has no resolver to rebind with;
-//   * the bridge is useless until it proves the passphrase: `hello` carries a fresh 16-byte nonce,
-//     the first client message must be `sha1(nonce || passphrase)`, and the passphrase itself never
-//     crosses the socket. `http` and `ws` are plaintext, so that digest is the only thing standing
-//     between "anyone who can reach the port" and "someone who knows the passphrase" - it is not
-//     encryption, and the module header says so;
+//     rather than merely look odd, because this build has no resolver to rebind with. On a wildcard
+//     bind there is no single "landed on" address, so the rule becomes "a literal IP that is not
+//     loopback" - names are still refused, and `Origin: null` (sandboxed/file pages) is refused too;
+//   * the bridge may have to prove the passphrase, if one is configured: `hello` says which, and
+//     when it says `required` the page answers with `sha1(nonce || passphrase)` over a fresh
+//     16-byte nonce, so the passphrase itself never crosses the socket. `http` and `ws` are
+//     plaintext, so that digest is the only thing standing between "anyone who can reach the port"
+//     and "someone who knows the passphrase" - it is not encryption, and the module header says so.
+//     不写口令 = 这一层没有，剩下的边界就是上面那条入站策略，README 与本文件都不假装它还在了；
 //   * the page ships with `Content-Security-Policy: default-src 'none'` (inline script/style only)
 //     and contains no external URL at all, so the browser is told to fetch nothing else;
 //   * client frames must be masked (RFC 6455 §5.3) and are length-capped; the only routes are `/`
@@ -67,8 +71,10 @@ pub enum OutMsg {
     Event(String),
 }
 
-/// Bind the operator's chosen address and serve until the process exits.
-pub fn serve(bind: SocketAddr, passphrase: &str) -> hbb_common::ResultType<()> {
+/// Serve until the process exits. `bind` is either the one address `webgate-bind` named or the
+/// wildcard the turnkey default picked; `auth` is the configured passphrase, empty when there is
+/// none (see `bridge`, which turns that into the `hello.auth` the page reads).
+pub fn serve(bind: SocketAddr, auth: &str) -> hbb_common::ResultType<()> {
     let listener = TcpListener::bind(bind).map_err(|e| {
         hbb_common::anyhow::anyhow!(
             "webgate: cannot listen on {} (another webgate already running?): {}",
@@ -105,9 +111,9 @@ pub fn serve(bind: SocketAddr, passphrase: &str) -> hbb_common::ResultType<()> {
                 continue;
             }
         };
-        let passphrase = passphrase.to_owned();
+        let auth = auth.to_owned();
         std::thread::spawn(move || {
-            if let Err(e) = handle(stream, local, &passphrase) {
+            if let Err(e) = handle(stream, local, &auth) {
                 log::trace!("webgate: connection ended: {}", e);
             }
         });
@@ -116,11 +122,7 @@ pub fn serve(bind: SocketAddr, passphrase: &str) -> hbb_common::ResultType<()> {
 }
 
 /// The socket's whole life: request head, then either the page or the bridge.
-fn handle(
-    stream: TcpStream,
-    local: SocketAddr,
-    passphrase: &str,
-) -> hbb_common::ResultType<()> {
+fn handle(stream: TcpStream, local: SocketAddr, auth: &str) -> hbb_common::ResultType<()> {
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     stream.set_nodelay(true).ok();
@@ -170,7 +172,10 @@ fn handle(
     };
 
     // The address the browser used must be the address the kernel delivered it to. A hostname in
-    // `Host` therefore never matches, and neither does a proxy that rewrites it.
+    // `Host` therefore never matches, and neither does a proxy that rewrites it. On the turnkey
+    // wildcard bind the accepted socket still reports the real interface address on Windows and
+    // Linux, but if a platform hands back the unspecified address we refuse names and loopback and
+    // accept any other literal IP - that is the widest the rule ever gets.
     let host = header("host");
     if !host_matches(&host, local) {
         return Err(hbb_common::anyhow::anyhow!(
@@ -182,7 +187,12 @@ fn handle(
 
     if method == "GET" && path == "/ws" {
         let origin = header("origin");
-        if !origin.is_empty() && !origin_contains(&origin, local) {
+        // `Origin: null` is what a sandboxed or `file://` page sends; the page we serve always has a
+        // literal IP in its origin, so a null here is a different document trying to reach us.
+        if !origin.is_empty()
+            && origin.trim().to_lowercase() != "null"
+            && !origin_contains(&origin, local)
+        {
             return Err(hbb_common::anyhow::anyhow!(
                 "webgate: rejected Origin {:?}, the page must come from this listener",
                 origin
@@ -197,7 +207,7 @@ fn handle(
         if key.is_empty() || key.len() > 64 {
             return Err(hbb_common::anyhow::anyhow!("webgate: missing handshake key"));
         }
-        return bridge(reader, &key, &host, passphrase);
+        return bridge(reader, &key, &host, auth);
     }
 
     if method == "GET" && (path == "/" || path == "/index.html") {
@@ -215,7 +225,7 @@ fn handle(
 /// to, so only the address part is compared against where the socket actually landed.
 fn host_matches(host: &str, local: SocketAddr) -> bool {
     match split_host(host) {
-        Some(value) => value == local.ip().to_string(),
+        Some(value) => address_allowed(&value, local),
         None => false,
     }
 }
@@ -227,8 +237,26 @@ fn origin_contains(origin: &str, local: SocketAddr) -> bool {
         .nth(1)
         .unwrap_or_else(|| origin.trim_start_matches('/'));
     match split_host(rest) {
-        Some(value) => value == local.ip().to_string(),
+        Some(value) => address_allowed(&value, local),
         None => false,
+    }
+}
+
+/// Does an address the browser named belong on this listener? Normally it has to be the very
+/// address the socket landed on. The turnkey wildcard bind is the one case where it may not be:
+/// if the kernel hands back an unspecified local address, any literal IP passes except loopback,
+/// which has no business reaching a gateway meant to be opened from another machine.
+fn address_allowed(value: &str, local: SocketAddr) -> bool {
+    if !local.ip().is_unspecified() && value == local.ip().to_string() {
+        return true;
+    }
+    if !local.ip().is_unspecified() {
+        return false;
+    }
+    match value.parse::<std::net::IpAddr>() {
+        // Neither loopback nor the wildcard itself is a browser's way of reaching a gateway.
+        Ok(addr) => !addr.is_loopback() && !addr.is_unspecified(),
+        Err(_) => false,
     }
 }
 
@@ -295,13 +323,17 @@ fn plain(
     Ok(())
 }
 
-/// Upgrade, prove the passphrase, then run the bridge: one reader loop for commands, one writer
-/// loop for frames.
+/// Upgrade, then run the bridge: one reader loop for commands, one writer loop for frames.
+///
+/// `auth` is the configured `webgate-passphrase`, empty when the operator did not set one. 这正是
+/// 开箱即用那条要求的落点：不写口令时这里直接 `auth-ok`，页面不弹任何东西；写了口令时仍然走
+/// per-connection nonce 摘要，口令本身照样不上网。两种情况下页面里那个「密码」输入框都是**被控端**的
+/// 会话密码，跟这里校验的网关口令不是同一回事。
 fn bridge(
     mut reader: BufReader<TcpStream>,
     key: &str,
     host: &str,
-    passphrase: &str,
+    auth: &str,
 ) -> hbb_common::ResultType<()> {
     let accept = hbb_common::base64::engine::general_purpose::STANDARD
         .encode(sha1(format!("{}{}", key, WS_GUID).as_bytes()));
@@ -322,40 +354,55 @@ fn bridge(
         writer: writer.clone(),
     };
 
+    let auth_required = !auth.trim().is_empty();
     // The challenge is fresh per socket, so the digest the page sends back is good for exactly one
     // connection: it cannot be captured once and replayed, and the passphrase never goes on the wire.
     let mut nonce = [0u8; 16];
-    OsRng.fill_bytes(&mut nonce);
-    let hello = json!({
+    if auth_required {
+        OsRng.fill_bytes(&mut nonce);
+    }
+    let mut hello = json!({
         "t": "hello",
-        "nonce": hbb_common::base64::engine::general_purpose::STANDARD.encode(nonce),
+        "auth": if auth_required { "required" } else { "off" },
         "host": host,
         "peer_port": netguard::direct_peer_port(),
     });
+    if auth_required {
+        hello["nonce"] =
+            json!(hbb_common::base64::engine::general_purpose::STANDARD.encode(nonce));
+    }
     send_text(&writer, &hello.to_string())?;
-    rd.stream.get_ref().set_read_timeout(Some(AUTH_TIMEOUT))?;
-    let proved = match rd.next_message() {
-        Some(WsMessage::Text(text)) => authenticated(&text, &nonce, passphrase),
-        Some(_) => {
-            log::warn!("webgate: the first frame after hello was not the passphrase digest");
-            false
+    if auth_required {
+        rd.stream.get_ref().set_read_timeout(Some(AUTH_TIMEOUT))?;
+        let proved = match rd.next_message() {
+            Some(WsMessage::Text(text)) => authenticated(&text, &nonce, auth),
+            Some(_) => {
+                log::warn!("webgate: the first frame after hello was not the passphrase digest");
+                false
+            }
+            None => false,
+        };
+        rd.stream.get_ref().set_read_timeout(Some(READ_TIMEOUT))?;
+        if !proved {
+            netguard::audit_denied(
+                "in",
+                host,
+                "webgate::http::auth",
+                "reason=passphrase note=the browser could not prove it knows webgate-passphrase",
+            );
+            let _ = send_text(
+                &writer,
+                r#"{"t":"closed","reason":"口令校验未通过，连接已关闭。"}"#,
+            );
+            let _ = write_frame(&writer, 0x8, &[0x08, 0x00]);
+            return Ok(());
         }
-        None => false,
-    };
-    rd.stream.get_ref().set_read_timeout(Some(READ_TIMEOUT))?;
-    if !proved {
-        netguard::audit_denied(
-            "in",
-            host,
-            "webgate::http::auth",
-            "reason=passphrase note=the browser could not prove it knows webgate-passphrase",
-        );
+    } else {
+        // 没口令 = 这台网关的边界就是上面那道入站策略，页面把这一点写给操作者看，不假装还有一层。
         let _ = send_text(
             &writer,
-            r#"{"t":"closed","reason":"口令校验未通过，连接已关闭。"}"#,
+            r#"{"t":"msg","text":"本网关未设置口令，能连到这个端口的内网地址都可以使用它。"}"#,
         );
-        let _ = write_frame(&writer, 0x8, &[0x08, 0x00]);
-        return Ok(());
     }
     send_text(&writer, r#"{"t":"state","s":"auth-ok","msg":""}"#)?;
 
@@ -629,11 +676,33 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_listener_still_refuses_names_and_loopback() {
+        // The turnkey default binds 0.0.0.0. If a platform reports the unspecified address as the
+        // local end, the rule widens to "a literal IP that is neither loopback nor the wildcard" -
+        // and no further: names still have to go through a resolver, which this build does not do.
+        let any = local("0.0.0.0", 21124);
+        assert!(host_matches("192.168.10.20:21124", any));
+        assert!(!host_matches("127.0.0.1:21124", any));
+        assert!(!host_matches("0.0.0.0:21124", any));
+        assert!(!host_matches("gate.example:21124", any));
+        assert!(!host_matches("", any));
+        // A named bind is exactly as strict as it always was.
+        let one = local("192.168.10.20", 21124);
+        assert!(host_matches("192.168.10.20", one));
+        assert!(!host_matches("192.168.10.21", one));
+    }
+
+    #[test]
     fn an_origin_may_carry_a_scheme_but_not_a_foreign_host() {
         let v4 = local("10.0.12.7", 21124);
         assert!(origin_contains("http://10.0.12.7:21124", v4));
         assert!(!origin_contains("http://10.0.12.8:21124", v4));
         assert!(!origin_contains("http://evil.example", v4));
+        // A wildcard bind does not make `null` (sandboxed/file document) an acceptable origin.
+        let any = local("0.0.0.0", 21124);
+        assert!(origin_contains("http://192.168.1.9:21124", any));
+        assert!(!origin_contains("null", any));
+        assert!(!origin_contains("http://127.0.0.1:21124", any));
     }
 
     #[test]

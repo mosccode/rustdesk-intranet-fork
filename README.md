@@ -148,46 +148,55 @@ option, which is useful for reaching a peer that has not moved its listener.
 
 ## Browser control console (`rustdesk-webgate`)
 
-The zip also contains `rustdesk-webgate.exe`: a small listener that serves one HTML page and
-drives a normal RustDesk session on your behalf. It is a **control end only** - the machine being
-controlled runs the ordinary client and gains no new inbound port, and the wire protocol between
-the gateway and that machine is the native RustDesk one.
+The zip also contains `rustdesk-webgate.exe` - unpacked, next to the client - and the release also
+carries it as its own single-file portable build, `rustdesk-intranet-webgate-1.5.0-x86_64.exe`.
+Either one is a small listener that serves one HTML page and drives a normal RustDesk session on
+your behalf. It is a **control end only** - the machine being controlled runs the ordinary client
+and gains no new inbound port, and the wire protocol between the gateway and that machine is the
+native RustDesk one.
 
 ```bat
-:: on the operator machine, with the same config directory the client uses
-rustdesk-webgate.exe
-:: then open http://<the address you bound>:<webgate-port>/ from a browser the guard allows
+:: anywhere on the operator machine - no configuration first, no setup
+rustdesk-intranet-webgate-1.5.0-x86_64.exe
+:: then open http://<address of this machine>:21124/ from a browser the guard allows
 ```
 
-The gateway refuses to start until all three of these are present under `[options]` in
-`RustDesk2.toml`; none of them is compiled in, and there is no default bind address:
+Nothing has to be written into any file for that to start: the gateway listens on every interface of
+the machine at port 21124, and the target address and the controlled side's own password are both
+typed into the page (the gateway authenticates the session with whatever the peer's own access
+settings require - that password is the one that unlocks the remote screen, not a gateway secret).
+The keys below are all optional; none of them is compiled in:
 
 ```toml
-webgate = "Y"
-webgate-bind = "192.168.10.20"
-webgate-passphrase = "operator passphrase"
-# optional
-webgate-port = "21124"
-webgate-jpeg-quality = "70"
+[options]
+webgate-port = "21124"              # listen port
+webgate-bind = "192.168.10.20"      # listen on ONE address instead of every interface
+webgate-passphrase = "..."          # ask every browser for a passphrase first
+webgate-jpeg-quality = "70"         # 30..=95
+webgate = "N"                       # keep the listener off on a machine that has it installed
 ```
 
 What that buys you, and what it costs:
 
-- The browser proves knowledge of the passphrase with `sha1(nonce || passphrase)` over a nonce the
-  gateway generates per connection, so the passphrase itself never crosses the socket. This is
-  authentication of the operator, not a secret shared with the peer.
+- Reach is decided by the guard, not by a secret. The page reaches the gateway over TCP, which is an
+  inbound connection like any other, so **the browser's address has to be allowed** on the machine
+  running the gateway: with no narrowing any private IPv4 connects and everything else is dropped
+  with an audit line; once `intranet-allowlist.conf` names ranges, the browser has to fall inside one
+  of them. If that is not enough for a segment, set `webgate-passphrase` - the browser then proves
+  knowledge of it with `sha1(nonce || passphrase)` over a nonce generated per connection, so the
+  passphrase itself never crosses the socket. Leaving it unset means no such layer, and the page says
+  so in the status log rather than pretending otherwise.
 - The browser-to-gateway hop is plain HTTP and WebSocket, **not TLS**, so run it on a trusted
   network segment. The gateway-to-controlled-machine hop keeps RustDesk's own handshake.
-- The page reaches the gateway over TCP, which is an inbound connection like any other, so the
-  **browser's address has to be allowed** on the machine running the gateway. With no narrowing that
-  means any private IPv4 address connects and everything else is dropped with an audit line; once
-  `intranet-allowlist.conf` names ranges, the browser has to fall inside one of them.
 - Frames are decoded and JPEG-encoded on the CPU. That is deliberate: the gateway has no GPU
   context, so it takes the RAM path rather than the texture path. Expect lower throughput than the
   desktop client, which is the price of having no plugin in the browser.
 - The same guard applies to the address you type into the page. The gateway is a `Session`, not a
   proxy: a target it would refuse in the desktop client - public space, a host name, or a private
   range the file has narrowed away - is refused here exactly the same way.
+- Double-clicking it may close the console window before you can read why it stopped. Whatever the
+  reason - started, refused, or listening - one line is written to `webgate-status.txt` next to the
+  client's config, so the answer is on disk either way.
 
 ## Security boundaries
 

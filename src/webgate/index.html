@@ -92,7 +92,7 @@
   <label for="addr">地址</label>
   <input id="addr" placeholder="10.0.12.34:9001" autocomplete="off" spellcheck="false">
   <label for="pass">密码</label>
-  <input id="pass" type="password" autocomplete="off">
+  <input id="pass" type="password" autocomplete="off" placeholder="被控端密码">
   <label><input id="view" type="checkbox"> 只观看</label>
   <button id="connect">连接</button>
   <button id="disconnect" class="plain" disabled>断开</button>
@@ -107,7 +107,8 @@
 <div id="stage" tabindex="0">
   <img id="screen" alt="远端屏幕" class="hidden">
   <img id="cursor" alt="">
-  <p id="placeholder">输入被控端的字面 IP（可带端口）与密码后点「连接」。<br>
+  <p id="placeholder">在这台机器自己的浏览器里就能用，别的机器要用 <code id="selfAddr">本机地址</code> 打开本页。<br>
+    输入被控端的字面 IP（可带端口）与它的密码后点「连接」——除了这两格，什么都不用预先配置。<br>
     画面与键鼠经由本机网关转发，不经过任何公网地址；此页面自身不加载任何外部资源。</p>
 </div>
 
@@ -248,6 +249,7 @@ const ui = {
   promptText: document.getElementById('promptText'),
   promptInput: document.getElementById('promptInput'),
   refresh: document.getElementById('refresh'),
+  selfAddr: document.getElementById('selfAddr'),
 };
 const wsState = { socket: null, nonce: null, geom: { w: 0, h: 0 }, connected: false };
 // `shapes` maps a cursor id to `{ image, hotx, hoty }`, exactly the triple the gateway sends in a
@@ -318,12 +320,13 @@ function connectBridge() {
 function handleEvent(message) {
   switch (message.t) {
     case 'hello':
-      wsState.nonce = message.nonce;
+      // `auth:"off"` 是默认形态：网关没配口令，直接进可用状态，什么都不用先输。
+      wsState.nonce = message.auth === 'required' ? message.nonce : null;
       if (message.peer_port) {
         // Prefill only when the operator has not typed anything, so a deliberate address survives.
         if (!ui.addr.value) ui.addr.placeholder = '10.0.12.34:' + message.peer_port;
       }
-      proof();
+      if (message.auth === 'required') proof();
       return;
     case 'state':
       if (message.s === 'connecting') setState('连接中', 'busy');
@@ -499,7 +502,9 @@ function showPrompt(title, text, options, onAnswer) {
 function proof() {
   // `showPrompt` rather than `window.prompt`: the browser's own box echoes the passphrase in clear
   // text, and this one masks it. The gateway gives up 30 seconds after `hello`, so say that here.
-  showPrompt('网关口令', '输入本网关的 webgate-passphrase 以通过校验。口令只在本机算摘要，不会发到网络上。网关等待 30 秒。', { input: 'passphrase' }, (phrase) => {
+  // Only reached when the gateway set `webgate-passphrase`; with no passphrase there is nothing to
+  // prove and `hello` said `auth:"off"`.
+  showPrompt('网关口令', '这台网关设了口令，输入它才能用（跟被控端密码不是同一回事）。口令只在本机算摘要，不会发到网络上。网关等待 30 秒。', { input: 'passphrase' }, (phrase) => {
     if (!phrase) {
       say('没有口令，无法通过网关验证。');
       if (wsState.socket) wsState.socket.close();
@@ -772,6 +777,7 @@ cursorObserver.observe(ui.screen, { attributes: true, attributeFilter: ['class',
 cursorState.id = '0';
 ui.cursor.addEventListener('load', () => paintCursor());
 
+ui.selfAddr.textContent = location.host;
 connectBridge();
 say('正在连接本机网关…');
 </script>

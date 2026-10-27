@@ -187,6 +187,31 @@ jobs:
           cargo build -p rustdesk-portable-packer --release --locked
           cp target/release/rustdesk-portable-packer.exe rustdesk-intranet-1.5.0-x86_64.exe
           ls -l rustdesk-intranet-1.5.0-x86_64.exe
+      - name: Build single-file portable browser console
+        shell: bash
+        run: |
+          # 需求方 2026-10-28 wants one file to double-click for the web console too, so the gateway gets
+          # its own portable build: `rustdesk-webgate.exe` links statically (no dll next to it), so the
+          # packed folder is that single binary and nothing else.
+          mkdir -p webgate-portal
+          cp target/release/rustdesk-webgate.exe webgate-portal/
+          cd libs/portable
+          python generate.py -f ../../webgate-portal -o . -e ../../webgate-portal/rustdesk-webgate.exe
+          cd ../..
+          # data.bin and app_metadata.toml are pulled in by `include_bytes!` in the *source*, and this
+          # package's build.rs declares no rerun-if-changed for them, so a plain second `cargo build`
+          # would reuse the first payload. Touching the sources that include them forces the rebuild.
+          touch libs/portable/src/bin_reader.rs libs/portable/src/main.rs
+          cargo build -p rustdesk-portable-packer --release --locked
+          cp target/release/rustdesk-portable-packer.exe rustdesk-intranet-webgate-1.5.0-x86_64.exe
+          ls -l rustdesk-intranet-webgate-1.5.0-x86_64.exe
+          # Proof that the second payload really was rebuilt: two identical hashes would mean the
+          # console portable silently carries the client's payload and would launch the wrong program.
+          if [ "$(sha256sum < rustdesk-intranet-1.5.0-x86_64.exe)" = "$(sha256sum < rustdesk-intranet-webgate-1.5.0-x86_64.exe)" ]; then
+            echo "FAIL: both portable builds are byte-identical"
+            exit 1
+          fi
+          echo "portable pair distinct: OK"
       - name: Locate artifacts
         shell: bash
         run: |
@@ -194,7 +219,7 @@ jobs:
           ls -l target/release/rustdesk-webgate.exe
           ls -l flutter/build/windows/x64/runner/Release
       - name: Scan artifact strings
-        run: python scripts/scan_strings.py target/release/librustdesk.dll target/release/rustdesk-webgate.exe flutter/build/windows/x64/runner/Release/data/app.so flutter/build/windows/x64/runner/Release/rustdesk.exe
+        run: python scripts/scan_strings.py target/release/librustdesk.dll target/release/rustdesk-webgate.exe flutter/build/windows/x64/runner/Release/data/app.so flutter/build/windows/x64/runner/Release/rustdesk.exe rustdesk-intranet-1.5.0-x86_64.exe rustdesk-intranet-webgate-1.5.0-x86_64.exe
       - name: Upload windows build
         uses: actions/upload-artifact@v4
         with:
@@ -204,6 +229,7 @@ jobs:
             target/release/rustdesk-webgate.exe
             flutter/build/windows/x64/runner/Release
             rustdesk-intranet-1.5.0-x86_64.exe
+            rustdesk-intranet-webgate-1.5.0-x86_64.exe
           retention-days: 7
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/')
@@ -212,11 +238,13 @@ jobs:
           mkdir -p dist/rustdesk-intranet
           cp -r flutter/build/windows/x64/runner/Release dist/rustdesk-intranet/
           cp target/release/librustdesk.dll dist/rustdesk-intranet/Release/
-          # Linked statically like the other bins, so it needs no dll; it shares the client's
-          # config directory, which is where the allow-list and `webgate-*` options live.
+          # Linked statically like the other bins, so it needs no dll; it shares the client's config
+          # directory, which is where the allow-list and the (optional) `webgate-*` options live.
+          # It also ships as its own single-file portable build next to this copy in the zip.
           cp target/release/rustdesk-webgate.exe dist/rustdesk-intranet/Release/
           cp LICENCE NOTICE MODIFICATIONS.md README.md dist/rustdesk-intranet/
           cp rustdesk-intranet-1.5.0-x86_64.exe dist/
+          cp rustdesk-intranet-webgate-1.5.0-x86_64.exe dist/
           cd dist && 7z a -tzip rustdesk-intranet-windows-x64.zip rustdesk-intranet
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
@@ -224,4 +252,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}"             dist/rustdesk-intranet-windows-x64.zip             dist/rustdesk-intranet-1.5.0-x86_64.exe             --title "${{ github.ref_name }}"             --notes "Windows x64 builds from source at ${{ github.sha }}. rustdesk-intranet-1.5.0-x86_64.exe is a single-file portable build of the client; the zip is the full directory and is the one that carries rustdesk-webgate.exe, the browser control console (run it from the extracted zip - the portable exe does not bundle it). Configure your intranet ranges in intranet-allowlist.conf, either as a file or from Settings · Security inside the client."
+          gh release create "${{ github.ref_name }}"             dist/rustdesk-intranet-windows-x64.zip             dist/rustdesk-intranet-1.5.0-x86_64.exe             dist/rustdesk-intranet-webgate-1.5.0-x86_64.exe             --title "${{ github.ref_name }}"             --notes "Windows x64 builds from source at ${{ github.sha }}. rustdesk-intranet-1.5.0-x86_64.exe is a single-file portable build of the client; rustdesk-intranet-webgate-1.5.0-x86_64.exe is a single-file portable build of the browser control console - double-click it, open http://THE_ADDRESS_OF_THIS_MACHINE:21124/ from any browser the intranet policy allows, and type the target IP plus the controlled side password in the page. Neither one needs any configuration to start. The zip is the full directory and also carries rustdesk-webgate.exe unpacked. To narrow which addresses may reach either program, edit intranet-allowlist.conf, as a file or from Settings · Security inside the client."

@@ -10,7 +10,9 @@
 //     This process only ever dials out to an allow-listed peer and serves one page.
 //
 // It is a console-subsystem binary on purpose: `webgate::run()` reports why it refused to start on
-// stderr, and an operator needs to see that the first time, not hunt for a log file.
+// stderr, and an operator needs to see that the first time, not hunt for a log file. Double-clicking
+// it can still close that window before anyone reads it, which is why every refusal -- and every
+// successful start -- also lands in one line of `webgate-status.txt` next to the config.
 //
 // The console itself is desktop-only (see `src/lib.rs`), but a `[[bin]]` is compiled whatever the
 // target, so the mobile build gets this stub instead of a build failure.

@@ -18,10 +18,15 @@
 // 口令本身不上网（见下面的 nonce 摘要），但画面不能。这一条写在 README 与本模块的交付说明里，
 // 不靠"内网所以安全"糊过去。
 //
-// 运维可配置的键都在 `RustDesk2.toml` 的 `[options]` 里，一个都不编译进源码：
-//   webgate             = "Y"                  必填，否则进程拒绝启动
-//   webgate-bind        = "<本机字面 IP>"       必填，监听地址；不给 0.0.0.0 兜底
-//   webgate-passphrase  = "<口令>"             必填，浏览器侧口令（不落网，只发摘要）
+// 开箱即用是需求方 2026-10-28 02:00 明确要的：「连谁，输什么密码全在网页里搞」「最好是单文件版本」。
+// 所以下面这三格**都不填也能跑** —— 双击 exe 就监听，浏览器打开页面，目标 IP 和被控端密码都在页面里输：
+//   webgate             = "Y"|"N"              可选；只有显式写成 "N" 才拒绝启动（留给不想开网关的机器）
+//   webgate-bind        = "<本机字面 IP>"       可选；不填 = 监听 0.0.0.0，即本机所有网卡
+//   webgate-passphrase  = "<口令>"              可选；不填 = 不做口令校验，谁能连到这个端口谁就能用
+// 可选不等于没有防护：`0.0.0.0` 上来的每个连接，先过 `netguard::check_inbound_addr`（非私有段一律拒并记
+// 审计），口令只是在这道门之后再加一层。要收窄就写 `intranet-allowlist.conf`，那是同一份名单。
+//
+// 运维可配置的键都在 `RustDesk2.toml` 的 `[options]` 里，一个都不编译进源码（站点值仍然不许硬编码）：
 //   webgate-port        = "21124"              可选，HTTP/WS 端口
 //   webgate-jpeg-quality= "70"                 可选，画面 JPEG 质量，只接受 30..=95，否则回 70
 //
@@ -33,9 +38,10 @@
 // supported consumer, so the shapes below are the whole interface.
 //
 // gateway -> page
-//   {"t":"hello","nonce":"<base64 16 B>","host":"<Host header>","peer_port":21118}   right after
-//     the socket opens; `nonce` is fresh per connection and `peer_port` is what
-//     `netguard::direct_peer_port()` says, so the page can prefill the connect form.
+//   {"t":"hello","auth":"required|off","nonce":"<base64 16 B,仅 required 时给>","host":"<Host header>",
+//    "peer_port":21118}   right after the socket opens; `nonce` is fresh per connection and
+//     `peer_port` is what `netguard::direct_peer_port()` says, so the page can prefill the connect
+//     form. `auth:"off"` means no `webgate-passphrase` is configured and the page must not prompt.
 //   {"t":"state","s":"auth-ok|connecting|connected|closing|disconnected|busy","msg":""}
 //   {"t":"geom","w":1920,"h":1080,"disp":0,"embedded":0|1,"scale":1.0}  remote geometry (scale only
 //     arrives with `set_display`, so it may be absent)
@@ -60,7 +66,8 @@
 //   {"t":"closed","reason":"..."}                    last frame before the socket dies
 //
 // page -> gateway
-//   {"t":"auth","d":"<base64 sha1(nonce_bytes || passphrase_utf8)>"}  must be the first message
+//   {"t":"auth","d":"<base64 sha1(nonce_bytes || passphrase_utf8)>"}  first message, only when
+//     `hello` said `auth:"required"`
 //   {"t":"open","addr":"192.168.10.15:9001","password":"...","view":false}
 //   {"t":"login","password":"..."}                    answer to a password prompt
 //   {"t":"insecure","yes":true}                       answer to the e2ee-unavailable prompt
@@ -122,6 +129,18 @@ fn port_from_str(raw: &str, fallback: u16) -> u16 {
     }
 }
 
+/// The turnkey default: no `webgate-bind` means every interface. This is the only guess the gateway
+/// makes, and it is a guess about *reach*, not about a destination - which peers may connect is still
+/// decided by `check_inbound_addr`, and which peers we may dial by the allow-list.
+fn bind_or_wildcard(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        "0.0.0.0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// `netguard::parse_bind_addr` wants one string, and an IPv6 address only survives being split on
 /// the last colon if it is bracketed first. Operators write either shape in `webgate-bind`.
 fn bind_target(ip: &str, port: u16) -> String {
@@ -134,24 +153,18 @@ fn bind_target(ip: &str, port: u16) -> String {
 
 /// Start the gateway. Blocking; the caller (`src/bin_webgate.rs`) never returns from it.
 ///
-/// Everything the operator can configure lives in `[options]` of `RustDesk2.toml`, next to the
-/// allow-list file, and is deliberately *not* compiled in: no site IP, no site port, no site
-/// password.
+/// 开箱即用：三格都不填也要能跑起来。目标机器与被控端密码都在网页里输，所以这里只决定两件小事——
+/// 在哪个地址上听、要不要口令。二者都有默认值，且默认值是安全上说得通的那一个：
+/// `0.0.0.0` 只是"每个网卡都听"，每个进来的连接仍然先过 netguard 的入站策略（非私有段一律拒绝并写审计），
+/// 不写口令 = 谁能连到这个端口谁就能用，这一点在页面与状态文件里都写明，不靠"内网所以安全"糊过去。
+/// 仍然一个站点值都不编译进源码：没有写死的 IP、端口、口令。
 pub fn run() {
     GATEWAY_PROCESS.store(true, Ordering::Relaxed);
 
-    // Fail closed on the four knobs that make this thing reachable at all. A half-configured
-    // gateway must not start and must not guess.
-    if option2yes(&option("webgate")) != Some(true) {
-        eprintln!("webgate: refusing to start, `webgate = \"Y\"` is not set in [options].");
-        return;
-    }
-    if option("webgate-passphrase").is_empty() {
-        eprintln!(
-            "webgate: refusing to start without `webgate-passphrase`. The browser connects to this \
-             port with no client certificate, so an unauthenticated listener is not a shape we are \
-             willing to ship."
-        );
+    // 显式 `webgate = "N"` 是关掉这台机器网关的唯一开关（不设 = 开），给的是"装了但不想让浏览器控制"
+    // 的机器一个不留后门口的退路。
+    if option2yes(&option("webgate")) == Some(false) {
+        refuse("这台机器把网关关着：[options] 里写了 webgate = \"N\"，改成 \"Y\" 或直接删掉这一行再启动。");
         return;
     }
     let stored_port = option("webgate-port");
@@ -163,24 +176,16 @@ pub fn run() {
              {} instead of the port you asked for.",
             stored_port, DEFAULT_HTTP_PORT
         );
+        refuse(&format!(
+            "端口号没写对：`webgate-port = {:?}` 不是 1-65535 的数字。删掉这一行就用默认端口 {}。",
+            stored_port, DEFAULT_HTTP_PORT
+        ));
         return;
     }
 
-    // The address to listen on is a site value, so there is no default and no wildcard fallback: an
-    // empty `webgate-bind` means "not configured", exactly like an empty passphrase. Guessing
-    // `0.0.0.0` would put a cleartext screen on every interface of a machine that may also have a
-    // routable one, which is the opposite of what this fork is for.
-    let bind_ip = option("webgate-bind").trim().to_string();
-    if bind_ip.is_empty() {
-        eprintln!(
-            "webgate: refusing to start without `webgate-bind`. Name the one literal address to \
-             listen on, for example `webgate-bind = \"10.0.12.5\"` - the address on this machine \
-             that the operators' browsers can reach. This build does not default to 0.0.0.0, \
-             because the page and the picture are cleartext and a wildcard listener would expose \
-             them on interfaces you did not choose."
-        );
-        return;
-    }
+    // `webgate-bind` 不填就听 0.0.0.0。写死了就必须是个字面地址——仍然不许填域名，绑定不能走到解析器
+    // （任务书 §二.1），这条由 `parse_bind_addr` 自己把关并写审计。
+    let bind_ip = bind_or_wildcard(&option("webgate-bind"));
     let port = http_port();
     // `parse_bind_addr` is netguard's own bind gate (the same one `tcp::new_listener` runs): a
     // literal address or nothing, no resolver, and the policy reason is recorded in the audit if
@@ -189,23 +194,77 @@ pub fn run() {
         Ok(bind) => bind,
         Err(e) => {
             eprintln!("webgate: cannot bind {} - {}", bind_target(&bind_ip, port), e);
+            refuse(&format!(
+                "监听地址用不了：`webgate-bind = {:?}` 必须是本机某个字面 IP（不给域名）。删掉这一行就听所有网卡。",
+                option("webgate-bind")
+            ));
             return;
         }
     };
+    let passphrase = option("webgate-passphrase");
+    let turned_off = passphrase.trim().is_empty();
+    write_status(bind, turned_off);
     log::info!(
-        "webgate: listening on {} (page at http://{}/), allow-list file: {}",
+        "webgate: listening on {} (page at http://{}/), passphrase check: {}, allow-list file: {}",
         bind,
         bind,
+        if turned_off { "off" } else { "on" },
         netguard::allowlist_path().display()
     );
-    if let Err(e) = http::serve(bind, &option("webgate-passphrase")) {
+    if let Err(e) = http::serve(bind, if turned_off { "" } else { &passphrase }) {
         log::error!("webgate: server loop ended: {}", e);
+        status_note(&format!("服务循环结束：{}", e));
     }
 }
 
-/// `option2bool` semantics are `=="Y"` for keys that do not start with `enable-`, which is the
-/// right default here (empty means "do not listen"). Wrapped so the intent is stated once and the
-/// `Some/None` shape makes an unset value distinguishable from an explicit `N` in the log.
+/// 双击 exe 时控制台会一闪而过，所以拒绝启动的理由除了打到 stderr，还写进配置目录里那个永远存在的
+/// 状态文件——运营看一眼文件就知道差什么，不用去找日志。
+fn refuse(reason: &str) {
+    eprintln!("webgate: refusing to start - {}", reason);
+    status_note(reason);
+}
+
+/// `<config_dir>/webgate-status.txt`：一行说清现在听在哪、口令校验开没开。写完就丢，不是日志。
+fn write_status(bind: std::net::SocketAddr, turned_off: bool) {
+    // A wildcard bind has no URL worth typing: `http://0.0.0.0/` is not it, and loopback is refused
+    // by the Host check on purpose (a gateway is meant to be opened through the address the network
+    // can actually reach). So the wildcard case names the rule instead of a fake address.
+    let page = if bind.ip().is_unspecified() {
+        format!(
+            "浏览器打开 http://<这台机器的内网 IP>:{}/（不要用 127.0.0.1，本机回环会被拒绝）",
+            bind.port()
+        )
+    } else {
+        format!("浏览器打开 http://{}/", bind)
+    };
+    status_note(&format!(
+        "已在 {} 监听，{} —— 连哪台机器、被控端密码都在页面里输。{}",
+        bind,
+        page,
+        if turned_off {
+            "当前没有网关口令：能连到这个端口的私有段地址都能用这台网关（入站仍受内网策略约束）。"
+        } else {
+            "已启用网关口令校验：页面要先输 webgate-passphrase。"
+        }
+    ));
+}
+
+fn status_note(text: &str) {
+    let path = hbb_common::config::Config::path("webgate-status.txt");
+    let line = format!(
+        "{} pid={} {}\n",
+        netguard::now_stamp(),
+        std::process::id(),
+        text
+    );
+    if let Err(e) = std::fs::write(&path, line) {
+        log::error!("webgate: cannot write status file {:?}: {}", path, e);
+    }
+}
+
+/// `option2bool` semantics are `=="Y"` for keys that do not start with `enable-`, so an unset value
+/// is `None` — which is exactly the turnkey case: 没写 = 开。Only an explicit `"N"` closes it, and
+/// only `run` reads that; the helper stays separate so the three-way shape is testable.
 fn option2yes(value: &str) -> Option<bool> {
     match value.trim() {
         "Y" => Some(true),
@@ -231,10 +290,20 @@ mod tests {
 
     #[test]
     fn the_listener_switch_has_no_opt_out_by_leaving_it_empty() {
-        assert_eq!(option2yes("Y"), Some(true));
-        assert_eq!(option2yes("N"), Some(false));
+        // 开箱即用靠的就是这条：留空不是"关"，只有显式的 "N" 才是。
         assert_eq!(option2yes(""), None);
         assert_eq!(option2yes("true"), None);
+        assert_eq!(option2yes("Y"), Some(true));
+        assert_eq!(option2yes("N"), Some(false));
+    }
+
+    #[test]
+    fn an_empty_bind_is_every_interface_and_a_written_one_is_kept() {
+        // 开箱即用那一半：什么都不写也要有地址可听；写了就照写，只多一个 trim。
+        assert_eq!(bind_or_wildcard(""), "0.0.0.0");
+        assert_eq!(bind_or_wildcard("   "), "0.0.0.0");
+        assert_eq!(bind_or_wildcard(" 10.0.12.5 "), "10.0.12.5");
+        assert_eq!(bind_or_wildcard("fd00::15"), "fd00::15");
     }
 
     #[test]
